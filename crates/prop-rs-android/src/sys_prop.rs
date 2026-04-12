@@ -498,9 +498,9 @@ pub fn scan_area(key: &str) -> SysPropResult<PropAreaScanReport> {
     let context = ctx.get_context_for_name(key).to_string();
     let path = ctx.ctx.context_file_path(&context);
 
-    let file = OpenOptions::new().read(true).write(true).open(&path)?;
-    let mut map = unsafe { MmapOptions::new().map_mut(&file) }?;
-    let cursor = Cursor::new(&mut map[..]);
+    let file = OpenOptions::new().read(true).open(&path)?;
+    let map = unsafe { MmapOptions::new().map(&file) }?;
+    let cursor = Cursor::new(&map[..]);
     let mut area =
         PropArea::new(cursor).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     let scan = area
