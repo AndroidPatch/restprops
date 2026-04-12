@@ -118,11 +118,10 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
         show_context: cli.show_context,
     };
 
-    // Validate: at most one special mode
+    // Validate: wait / file are exclusive; delete may be combined with compact.
     let special_modes = u8::from(cli.wait)
-        + u8::from(cli.delete)
-        + u8::from(cli.compact)
-        + u8::from(cli.file.is_some());
+        + u8::from(cli.file.is_some())
+        + u8::from(cli.delete || cli.compact);
     if special_modes > 1 {
         bail!("multiple operation modes detected");
     }
@@ -146,9 +145,9 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    // -c: compact property area memory
+    // -c without -d: compact property area memory.
     // When a positional argument is given, treat it as a SELinux context name.
-    if cli.compact {
+    if cli.compact && !cli.delete {
         let context = cli.name.as_deref();
         let compacted = sys_prop::compact(context).context("compact failed")?;
         if !compacted {
@@ -175,6 +174,10 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
         let deleted = rp.delete(name).context("delete failed")?;
         if !deleted {
             bail!("{name} not found");
+        }
+        if cli.compact {
+            let context = sys_prop::get_context(name).context("resolve context failed")?;
+            let _ = sys_prop::compact(Some(&context)).context("compact failed")?;
         }
         return Ok(());
     }

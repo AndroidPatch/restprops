@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::offset_of;
@@ -197,6 +197,17 @@ pub enum CompactResult {
     MovedObjects { old: u32, new: u32, objects_moved: usize },
 }
 
+/// Result of pruning a specific trie node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneNodeResult {
+    /// The target node was found and removed from trie topology.
+    Pruned,
+    /// The target node does not exist.
+    NotFound,
+    /// The target node exists but is not removable (`prop != 0` or has children).
+    NotPrunable,
+}
+
 /// Internal record used by the compaction pass.
 struct CompactRecord {
     /// Data-space offset of this allocation.
@@ -213,6 +224,12 @@ struct CompactRecord {
     /// offset from `prop_info`, so the new relative value must be recomputed
     /// whenever either object is moved.
     long_ref_prop: Option<u32>,
+}
+
+struct RemoveNodeOutcome {
+    new_root: u32,
+    found: bool,
+    removed: bool,
 }
 
 impl<M: Read + Seek> PropArea<M> {
@@ -1000,6 +1017,12 @@ impl<M: Read + Write + Seek> PropArea<M> {
     ///   (in-place, maintaining order), all intra-area references are patched,
     ///   and `bytes_used` is updated.
     pub fn compact_allocations(&mut self) -> Result<CompactResult> {
+        let max_steps = usize::max(1, self.data_size as usize / PROP_TRIE_NODE_HEADER_SIZE as usize);
+        let new_root = self.normalize_dead_trie_nodes(0, 0, max_steps)?;
+        if new_root != 0 {
+            return Err(PropAreaError::Corrupted("root trie node must remain at offset 0"));
+        }
+
         let bytes_used = self.bytes_used()?;
         let has_dirty  = self.has_dirty_backup()?;
 
@@ -1057,18 +1080,31 @@ impl<M: Read + Write + Seek> PropArea<M> {
                 let objects_moved = records.len() - first_idx;
 
                 // Compute new positions: pack everything from cursor onwards.
-                let mut offset_remap: std::collections::HashMap<u32, u32> =
-                    std::collections::HashMap::new();
+                let mut offset_remap: HashMap<u32, u32> = HashMap::new();
                 let mut new_cursor = cursor;
                 for rec in &records[first_idx..] {
                     offset_remap.insert(rec.offset, new_cursor);
                     new_cursor += rec.aligned_size;
                 }
 
-                // Move each allocation and patch the reference pointing to it.
+                // Copy all moved allocations into place first, preserving the
+                // original bytes until every destination has been populated.
+                let mut moved_data = Vec::with_capacity(records.len() - first_idx);
                 for rec in &records[first_idx..] {
                     let new_offset = *offset_remap.get(&rec.offset).unwrap();
+                    if new_offset != rec.offset {
+                        moved_data.push((new_offset, self.read_data(rec.offset, rec.aligned_size)?));
+                    }
+                }
 
+                for (new_offset, data) in &moved_data {
+                    self.write_bytes_data(*new_offset, data)?;
+                }
+
+                // Patch references after all copies so rewritten pointers do
+                // not get clobbered by a later object move.
+                for rec in &records[first_idx..] {
+                    let new_offset = *offset_remap.get(&rec.offset).unwrap();
                     if let (Some(ref_dat), Some(ref_off)) = (rec.referer_data, rec.refer_off) {
                         // The referer itself may have been moved; look up its new position.
                         let new_ref_dat =
@@ -1084,14 +1120,6 @@ impl<M: Read + Write + Seek> PropArea<M> {
                             self.write_u32_data(field, new_offset)?;
                         }
                     }
-
-                    // Copy the allocation to its compacted position.
-                    // new_offset < rec.offset always (we're filling holes), so
-                    // reading first then writing is safe.
-                    if new_offset != rec.offset {
-                        let data = self.read_data(rec.offset, rec.aligned_size)?;
-                        self.write_bytes_data(new_offset, &data)?;
-                    }
                 }
 
                 // Zero the reclaimed tail and update bytes_used.
@@ -1105,6 +1133,48 @@ impl<M: Read + Write + Seek> PropArea<M> {
                 })
             }
         }
+    }
+
+    /// Prune one specific trie node by full property-path key.
+    ///
+    /// The key is interpreted as trie segments (same validation as property keys).
+    /// Only empty nodes can be removed: node must have `prop == 0` and no `children`.
+    pub fn prune_trie_node(&mut self, key: &str) -> Result<PruneNodeResult> {
+        let segments = self.validate_key(key)?;
+        let target = segments
+            .last()
+            .copied()
+            .ok_or_else(|| PropAreaError::InvalidKey(key.to_owned()))?;
+
+        // Traverse to parent segment; for single-segment keys parent is root.
+        let mut parent = 0u32;
+        for seg in &segments[..segments.len().saturating_sub(1)] {
+            let current = self.read_node(parent)?;
+            if current.children == 0 {
+                return Ok(PruneNodeResult::NotFound);
+            }
+            let Some(next) = self.find_sibling(current.children, seg)? else {
+                return Ok(PruneNodeResult::NotFound);
+            };
+            parent = next;
+        }
+
+        let root = self.read_u32_data(parent + NODE_CHILDREN_OFFSET)?;
+        if root == 0 {
+            return Ok(PruneNodeResult::NotFound);
+        }
+
+        let max_steps = usize::max(1, self.data_size as usize / PROP_TRIE_NODE_HEADER_SIZE as usize);
+        let outcome = self.remove_sibling_node(root, target, 0, max_steps)?;
+        if !outcome.found {
+            return Ok(PruneNodeResult::NotFound);
+        }
+        if !outcome.removed {
+            return Ok(PruneNodeResult::NotPrunable);
+        }
+
+        self.write_u32_data(parent + NODE_CHILDREN_OFFSET, outcome.new_root)?;
+        Ok(PruneNodeResult::Pruned)
     }
 
     fn ensure_traverse_trie(&mut self, key: &str) -> Result<u32> {
@@ -1341,6 +1411,166 @@ impl<M: Read + Write + Seek> PropArea<M> {
         }
 
         Ok(false)
+    }
+
+    fn normalize_dead_trie_nodes(
+        &mut self,
+        offset: u32,
+        depth: usize,
+        max_steps: usize,
+    ) -> Result<u32> {
+        if depth >= max_steps {
+            return Err(PropAreaError::Corrupted(
+                "possible cycle while normalizing trie",
+            ));
+        }
+
+        let node = self.read_node(offset)?;
+
+        let left = if node.left != 0 {
+            self.normalize_dead_trie_nodes(node.left, depth + 1, max_steps)?
+        } else {
+            0
+        };
+        if left != node.left {
+            self.write_u32_data(offset + NODE_LEFT_OFFSET, left)?;
+        }
+
+        let children = if node.children != 0 {
+            self.normalize_dead_trie_nodes(node.children, depth + 1, max_steps)?
+        } else {
+            0
+        };
+        if children != node.children {
+            self.write_u32_data(offset + NODE_CHILDREN_OFFSET, children)?;
+        }
+
+        let right = if node.right != 0 {
+            self.normalize_dead_trie_nodes(node.right, depth + 1, max_steps)?
+        } else {
+            0
+        };
+        if right != node.right {
+            self.write_u32_data(offset + NODE_RIGHT_OFFSET, right)?;
+        }
+
+        if node.namelen == 0 || node.prop != 0 || children != 0 {
+            return Ok(offset);
+        }
+
+        self.zero_data(offset + PROP_TRIE_NODE_HEADER_SIZE, node.namelen + 1)?;
+        self.zero_data(offset, PROP_TRIE_NODE_HEADER_SIZE)?;
+        self.merge_sibling_subtrees(left, right, max_steps)
+    }
+
+    fn remove_sibling_node(
+        &mut self,
+        root_offset: u32,
+        target: &str,
+        depth: usize,
+        max_steps: usize,
+    ) -> Result<RemoveNodeOutcome> {
+        if depth >= max_steps {
+            return Err(PropAreaError::Corrupted(
+                "possible cycle while pruning sibling tree",
+            ));
+        }
+
+        let node = self.read_node(root_offset)?;
+        match cmp_prop_name(target, &node.name) {
+            std::cmp::Ordering::Less => {
+                if node.left == 0 {
+                    return Ok(RemoveNodeOutcome {
+                        new_root: root_offset,
+                        found: false,
+                        removed: false,
+                    });
+                }
+                let child = self.remove_sibling_node(node.left, target, depth + 1, max_steps)?;
+                if child.new_root != node.left {
+                    self.write_u32_data(root_offset + NODE_LEFT_OFFSET, child.new_root)?;
+                }
+                Ok(RemoveNodeOutcome {
+                    new_root: root_offset,
+                    found: child.found,
+                    removed: child.removed,
+                })
+            }
+            std::cmp::Ordering::Greater => {
+                if node.right == 0 {
+                    return Ok(RemoveNodeOutcome {
+                        new_root: root_offset,
+                        found: false,
+                        removed: false,
+                    });
+                }
+                let child = self.remove_sibling_node(node.right, target, depth + 1, max_steps)?;
+                if child.new_root != node.right {
+                    self.write_u32_data(root_offset + NODE_RIGHT_OFFSET, child.new_root)?;
+                }
+                Ok(RemoveNodeOutcome {
+                    new_root: root_offset,
+                    found: child.found,
+                    removed: child.removed,
+                })
+            }
+            std::cmp::Ordering::Equal => {
+                if node.prop != 0 || node.children != 0 {
+                    return Ok(RemoveNodeOutcome {
+                        new_root: root_offset,
+                        found: true,
+                        removed: false,
+                    });
+                }
+
+                if node.namelen != 0 {
+                    self.zero_data(root_offset + PROP_TRIE_NODE_HEADER_SIZE, node.namelen + 1)?;
+                }
+                self.zero_data(root_offset, PROP_TRIE_NODE_HEADER_SIZE)?;
+
+                let new_root = self.merge_sibling_subtrees(node.left, node.right, max_steps)?;
+                Ok(RemoveNodeOutcome {
+                    new_root,
+                    found: true,
+                    removed: true,
+                })
+            }
+        }
+    }
+
+    fn merge_sibling_subtrees(&mut self, left: u32, right: u32, max_steps: usize) -> Result<u32> {
+        if left == 0 {
+            return Ok(right);
+        }
+        if right == 0 {
+            return Ok(left);
+        }
+
+        // Keep `right` as root. Its existing left subtree contains names
+        // between the removed node and `right`, so splice that subtree onto the
+        // right-most branch of `left`, then make `left` the new direct left child.
+        let existing_left = self.read_u32_data(right + NODE_LEFT_OFFSET)?;
+        if existing_left != 0 {
+            self.attach_rightmost(left, existing_left, max_steps)?;
+        }
+        self.write_u32_data(right + NODE_LEFT_OFFSET, left)?;
+        Ok(right)
+    }
+
+    fn attach_rightmost(&mut self, root: u32, subtree: u32, max_steps: usize) -> Result<()> {
+        let mut cursor = root;
+        for _ in 0..max_steps {
+            let next = self.read_u32_data(cursor + NODE_RIGHT_OFFSET)?;
+            if next == 0 {
+                self.write_u32_data(cursor + NODE_RIGHT_OFFSET, subtree)?;
+                return Ok(());
+            }
+            cursor = next;
+        }
+
+        Err(PropAreaError::Corrupted(
+            "possible cycle while attaching merged sibling subtree",
+        ))
     }
 
     fn allocate_obj(&mut self, size: u32) -> Result<u32> {

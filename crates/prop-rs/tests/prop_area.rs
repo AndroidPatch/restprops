@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use prop_rs::{
-    CompactResult, PropArea, PropAreaObjectKind, PROP_AREA_HEADER_SIZE,
+    CompactResult, PropArea, PropAreaObjectKind, PruneNodeResult, PROP_AREA_HEADER_SIZE,
     PROP_AREA_MAGIC, PROP_AREA_VERSION, PROP_VALUE_MAX,
 };
 
@@ -404,4 +404,121 @@ fn compact_after_long_property_delete_leaves_no_holes() {
     assert_eq!(area.get_property("persist.a").unwrap(), Some("short".to_owned()));
     assert_eq!(area.get_property("persist.c").unwrap(), Some("short2".to_owned()));
     assert_eq!(area.get_property("persist.b").unwrap(), None);
+}
+
+#[test]
+fn prune_node_removes_empty_leaf_node() {
+    let mut area = new_area(8192);
+    area.set_property("ro.boot.selinux", "permissive").unwrap();
+    area.set_property("ro.boot.hardware", "qcom").unwrap();
+
+    assert!(area.delete_property_no_prune("ro.boot.selinux").unwrap());
+
+    let before = area.scan_allocations().unwrap();
+    assert!(before
+        .objects
+        .iter()
+        .any(|o| o.kind == PropAreaObjectKind::TrieNode && o.detail == "selinux"));
+
+    let result = area.prune_trie_node("ro.boot.selinux").unwrap();
+    assert_eq!(result, PruneNodeResult::Pruned);
+    assert_eq!(area.get_property("ro.boot.selinux").unwrap(), None);
+    assert_eq!(
+        area.get_property("ro.boot.hardware").unwrap(),
+        Some("qcom".to_owned())
+    );
+
+    let after = area.scan_allocations().unwrap();
+    assert!(after
+        .objects
+        .iter()
+        .all(|o| !(o.kind == PropAreaObjectKind::TrieNode && o.detail == "selinux")));
+}
+
+#[test]
+fn prune_node_rejects_non_empty_node() {
+    let mut area = new_area(4096);
+    area.set_property("ro.boot.selinux", "permissive").unwrap();
+
+    let result = area.prune_trie_node("ro.boot.selinux").unwrap();
+    assert_eq!(result, PruneNodeResult::NotPrunable);
+    assert_eq!(
+        area.get_property("ro.boot.selinux").unwrap(),
+        Some("permissive".to_owned())
+    );
+}
+
+#[test]
+fn compact_normalizes_dead_boot_trie_nodes_without_losing_props() {
+    let mut area = new_area(16384);
+    let props = [
+        ("ro.boot.selinux", "permissive"),
+        ("ro.boot.hardware", "qcom"),
+        ("ro.boot.memcg", "1"),
+        ("ro.boot.usbcontroller", "a600000.dwc3"),
+        ("ro.boot.load_modules_parallel", "true"),
+        ("ro.boot.vendor.qspa", "true"),
+        ("ro.boot.bootdevice", "1d84000.ufshc"),
+        ("ro.boot.boot_devices", "soc/1d84000.ufshc"),
+        ("ro.boot.prjname", "23851"),
+        ("ro.boot.mode", "normal"),
+        ("ro.boot.chipecid", "000004481221d012"),
+        ("ro.boot.chipid", "1221d012"),
+        ("ro.boot.baseband", "msm"),
+        ("ro.boot.dtbo_idx", "7"),
+        ("ro.boot.dtb_idx", "2"),
+        ("ro.boot.force_normal_boot", "0"),
+        ("ro.boot.verifiedbootstate", "orange"),
+        ("ro.boot.keymaster", "1"),
+        ("ro.boot.vbmeta.device", "PARTUUID=test"),
+        ("ro.boot.vbmeta.avb_version", "1.2"),
+        ("ro.boot.vbmeta.device_state", "unlocked"),
+        ("ro.boot.vbmeta.hash_alg", "sha256"),
+        ("ro.boot.vbmeta.size", "21056"),
+        ("ro.boot.vbmeta.digest", "deadbeef"),
+        ("ro.boot.veritymode", "enforcing"),
+        ("ro.boot.veritymode.managed", "yes"),
+        ("ro.bootmode", "normal"),
+        ("ro.baseband", "msm"),
+        ("ro.bootloader", "unknown"),
+        ("ro.hardware", "qcom"),
+        ("ro.revision", "0"),
+        ("ro.boot.charger.mode", "unknow"),
+        ("ro.boot.avb_version", "1.2"),
+        ("ro.boot.flash.locked", "0"),
+    ];
+
+    for (key, value) in props {
+        area.set_property(key, value).unwrap();
+    }
+
+    assert!(area.delete_property_no_prune("ro.boot.selinux").unwrap());
+    let result = area.compact_allocations().unwrap();
+    assert!(!matches!(result, CompactResult::NoHoles));
+
+    let scan = area.scan_allocations().unwrap();
+    assert_eq!(scan.holes.len(), 0);
+    assert!(scan
+        .objects
+        .iter()
+        .all(|o| !(o.kind == PropAreaObjectKind::TrieNode && o.detail == "selinux")));
+
+    assert_eq!(area.get_property("ro.boot.selinux").unwrap(), None);
+    assert_eq!(
+        area.get_property("ro.boot.hardware").unwrap(),
+        Some("qcom".to_owned())
+    );
+    assert_eq!(area.get_property("ro.boot.memcg").unwrap(), Some("1".to_owned()));
+    assert_eq!(
+        area.get_property("ro.boot.usbcontroller").unwrap(),
+        Some("a600000.dwc3".to_owned())
+    );
+    assert_eq!(
+        area.get_property("ro.boot.vbmeta.hash_alg").unwrap(),
+        Some("sha256".to_owned())
+    );
+    assert_eq!(
+        area.get_property("ro.boot.flash.locked").unwrap(),
+        Some("0".to_owned())
+    );
 }

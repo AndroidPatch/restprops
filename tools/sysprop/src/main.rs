@@ -26,6 +26,7 @@
 //! sysprop area { --context <CTX> | --path <FILE> } del <KEY>
 //! sysprop area { --context <CTX> | --path <FILE> } list
 //! sysprop area { --context <CTX> | --path <FILE> } scan [--objects]
+//! sysprop area { --context <CTX> | --path <FILE> } prune-node <KEY>
 //! ```
 //!
 //! # Global options
@@ -47,7 +48,7 @@ use memmap2::{Mmap, MmapMut, MmapOptions};
 
 use prop_rs::{
     CompactResult, PersistentPropertyFile, PropArea, PropAreaAllocationScan, PropAreaError,
-    PropAreaObjectKind, PropertyContext, ANDROID_PERSISTENT_PROP_FILE,
+    PropAreaObjectKind, PropertyContext, PruneNodeResult, ANDROID_PERSISTENT_PROP_FILE,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -325,6 +326,13 @@ enum AreaCommand {
 
     /// Compact the prop area, eliminating holes left by deleted properties.
     Compact,
+
+    /// Prune one empty trie node by full path key (segment node).
+    #[command(name = "prune-node")]
+    PruneNode {
+        /// Full path key to the trie node, e.g. `ro.boot.selinux`.
+        key: String,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1231,6 +1239,23 @@ fn cmd_area(props_dir: Option<&Path>, system_root: Option<&Path>, args: &AreaArg
 
         AreaCommand::Compact => {
             cmd_area_compact(&area_path)?;
+        }
+
+        AreaCommand::PruneNode { key } => {
+            let mut area = open_area_rw(&area_path)?;
+            match area.prune_trie_node(key).map_err(prop_area_err)? {
+                PruneNodeResult::Pruned => {
+                    area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))?;
+                }
+                PruneNodeResult::NotFound => {
+                    eprintln!("{key}: trie node not found");
+                    process::exit(1);
+                }
+                PruneNodeResult::NotPrunable => {
+                    eprintln!("{key}: trie node is not empty (has value or children)");
+                    process::exit(2);
+                }
+            }
         }
     }
     Ok(())
