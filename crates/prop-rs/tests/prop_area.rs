@@ -311,6 +311,8 @@ fn compact_on_area_without_holes_returns_no_holes() {
 
 #[test]
 fn compact_reclaims_trailing_hole() {
+    const EMPTY_AREA_BYTES_USED_WITH_DIRTY_BACKUP: u32 = 20 + PROP_VALUE_MAX as u32;
+
     let mut area = new_area(4096);
     area.set_property("ro.z", "last").unwrap();
 
@@ -322,7 +324,7 @@ fn compact_reclaims_trailing_hole() {
 
     let result = area.compact_allocations().unwrap();
     match result {
-        CompactResult::NoHoles => {} // already reclaimed by prune_trie — also acceptable
+        CompactResult::NoHoles => {}
         CompactResult::AdjustedBytesUsed { old, new } => {
             assert!(new <= old, "bytes_used should not grow");
         }
@@ -334,6 +336,12 @@ fn compact_reclaims_trailing_hole() {
     // After compaction the area must be internally consistent.
     let scan = area.scan_allocations().unwrap();
     assert_eq!(scan.holes.len(), 0, "no holes should remain after compact");
+    assert!(scan.has_dirty_backup, "empty area should retain dirty-backup space");
+    assert_eq!(
+        scan.bytes_used,
+        EMPTY_AREA_BYTES_USED_WITH_DIRTY_BACKUP,
+        "compact should preserve the canonical empty-area footprint",
+    );
 }
 
 #[test]

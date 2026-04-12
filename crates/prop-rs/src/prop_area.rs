@@ -1025,6 +1025,9 @@ impl<M: Read + Write + Seek> PropArea<M> {
 
         let bytes_used = self.bytes_used()?;
         let has_dirty  = self.has_dirty_backup()?;
+        let root = self.read_node(0)?;
+        let preserve_empty_dirty_backup =
+            root.children == 0 && bytes_used >= INITIAL_BYTES_USED;
 
         // Build a reference-tracking record for every live allocation.
         let mut records: Vec<CompactRecord> = Vec::new();
@@ -1051,7 +1054,11 @@ impl<M: Read + Write + Seek> PropArea<M> {
         records.sort_by_key(|r| r.offset);
 
         // Walk through records in offset order to find the first hole.
-        let initial = if has_dirty { INITIAL_BYTES_USED } else { PROP_TRIE_NODE_HEADER_SIZE };
+        let initial = if has_dirty || preserve_empty_dirty_backup {
+            INITIAL_BYTES_USED
+        } else {
+            PROP_TRIE_NODE_HEADER_SIZE
+        };
         let mut cursor = initial;
         let mut first_hole_idx: Option<usize> = None;
         for (i, rec) in records.iter().enumerate() {
