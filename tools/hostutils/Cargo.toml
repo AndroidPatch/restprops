@@ -1,11 +1,11 @@
 [package]
-name = "cargo-android-sysprop"
+name = "hostutils"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "cargo-android-sysprop"
-path = "src/main.rs"
+name = "deployer"
+path = "src/deployer.rs"
 
 [[bin]]
 name = "resetprop-tester"

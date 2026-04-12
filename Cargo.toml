@@ -4,7 +4,6 @@ members = [
     "crates/prop-rs-android",
     "tools/sysprop",
     "tools/resetprop",
-    "tools/gen-sample-props",
-    "tools/cargo-android-sysprop",
+    "tools/hostutils",
 ]
 resolver = "2"

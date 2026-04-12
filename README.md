@@ -88,9 +88,6 @@ The repository includes:
 - `prop-rs-android`: Android platform bindings (bionic system property API, SELinux)
 - `sysprop`: the main context-aware CLI for offline prop-area analysis
 - `resetprop`: Android-specific CLI counterpart to Magisk's resetprop
-- `read_props`: a minimal raw prop-area reader
-- `write_props`: a minimal raw prop-area writer
-- `cargo-android-sysprop`: helper for building and pushing to Android via `cargo ndk` + `adb`
 
 ### 8. Tested against synthetic and fixture-based cases
 
@@ -126,12 +123,10 @@ ksu_props/
 ├── tools/
 │   ├── sysprop/                  # platform-independent CLI (offline prop-area analysis)
 │   │   └── src/
-│   │       ├── main.rs           — main CLI with context-routed operations
-│   │       ├── read_props.rs     — simple raw reader
-│   │       └── write_props.rs    — simple raw writer
+│   │       └── main.rs           — main CLI with context-routed operations
 │   ├── resetprop/                # Android-specific CLI (counterpart to Magisk's resetprop)
 │   ├── gen-sample-props/         # test fixture generator
-│   └── cargo-android-sysprop/    # build & deploy helper (cargo ndk + adb)
+│   └── hostutils/    # build & deploy helper (cargo ndk + adb)
 └── Cargo.toml
 ```
 
@@ -295,27 +290,12 @@ resetprop -Z
 | `-f FILE` | Load and set properties from file |
 | `--timeout N` | Wait timeout in seconds (default: infinite) |
 
-## Minimal tools
-
-### Read a raw prop-area file
-
-```bash
-cargo run --bin read_props -- tests/fixtures/sample_props.prop
-cargo run --bin read_props -- tests/fixtures/sample_props.prop ro.product.locale
-```
-
-### Write a raw prop-area file
-
-```bash
-cargo run --bin write_props -- tests/fixtures/sample_props.prop ro.product.locale=en-US
-```
-
 ## Deploy `sysprop` to Android
 
 If `cargo ndk` and `adb` are available:
 
 ```bash
-cargo run --bin cargo-android-sysprop -- --target aarch64-linux-android --profile release
+cargo deployer --target aarch64-linux-android --profile release
 ```
 
 The helper builds `sysprop`, pushes it to the device, and marks it executable.

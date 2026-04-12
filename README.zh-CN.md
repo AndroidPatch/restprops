@@ -94,9 +94,6 @@ property context 解析器使用普通文件 I/O，可以直接处理从 Android
 - `prop-rs-android`：Android 平台绑定（bionic 系统属性 API、SELinux）
 - `sysprop`：主 CLI，支持 context 路由，离线分析 prop-area
 - `resetprop`：Android 平台专用 CLI，对标 Magisk resetprop
-- `read_props`：最小原始 prop-area 读取工具
-- `write_props`：最小原始 prop-area 写入工具
-- `cargo-android-sysprop`：借助 `cargo ndk` + `adb` 构建并推送到 Android 的辅助工具
 
 ### 8. 有真实用例测试，不只是理论支持
 
@@ -134,12 +131,10 @@ ksu_props/
 ├── tools/
 │   ├── sysprop/                  # 平台无关 CLI（离线 prop-area 分析）
 │   │   └── src/
-│   │       ├── main.rs           — 主 CLI，支持 context 路由
-│   │       ├── read_props.rs     — 简化版原始读取工具
-│   │       └── write_props.rs    — 简化版原始写入工具
+│   │       └── main.rs           — 主 CLI，支持 context 路由
 │   ├── resetprop/                # Android 平台专用 CLI（对标 Magisk resetprop）
 │   ├── gen-sample-props/         # 测试夹具生成器
-│   └── cargo-android-sysprop/    # 构建部署辅助（cargo ndk + adb）
+│   └── hostutils/    # 构建部署辅助（cargo ndk + adb）
 └── Cargo.toml
 ```
 
@@ -301,27 +296,12 @@ resetprop -Z
 | `-f FILE` | 从文件加载并设置属性 |
 | `--timeout N` | 等待超时秒数（默认：无限） |
 
-## 简化工具
-
-### 读取原始 prop-area 文件
-
-```bash
-cargo run --bin read_props -- tests/fixtures/sample_props.prop
-cargo run --bin read_props -- tests/fixtures/sample_props.prop ro.product.locale
-```
-
-### 写入原始 prop-area 文件
-
-```bash
-cargo run --bin write_props -- tests/fixtures/sample_props.prop ro.product.locale=en-US
-```
-
 ## 部署 `sysprop` 到 Android
 
 如果本机已经安装 `cargo ndk` 和 `adb`：
 
 ```bash
-cargo run --bin cargo-android-sysprop -- --target aarch64-linux-android --profile release
+cargo deployer --target aarch64-linux-android --profile release
 ```
 
 这个辅助工具会完成构建、推送到设备、并设置可执行权限。
