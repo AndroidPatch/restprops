@@ -4,8 +4,8 @@ mod persistent_prop;
 pub mod property_context;
 
 pub use prop_area::{
-    CompactResult, PropArea, PropAreaAllocationScan, PropAreaError, PropAreaHoleInfo,
-    PropAreaObjectInfo, PropAreaObjectKind, PropWriteResult, PruneNodeResult, Result,
+    PropArea, PropAreaAllocationScan, PropAreaError, PropAreaHoleInfo,
+    PropAreaObjectInfo, PropAreaObjectKind, PropWriteResult, Result,
 };
 pub use prop_info::{
     PropertyInfo, AREA_SERIAL_OFFSET, PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC, PROP_AREA_VERSION,

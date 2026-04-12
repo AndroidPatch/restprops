@@ -65,11 +65,6 @@ struct Args {
     #[arg(short = 'f', long = "file")]
     file: Option<String>,
 
-    /// Compact property area memory (reclaim holes left by deleted properties).
-    /// Optionally pass a SELinux context name to compact only that area.
-    #[arg(short = 'c', long = "compact")]
-    compact: bool,
-
     /// Show SELinux context when listing properties.
     #[arg(short = 'Z')]
     show_context: bool,
@@ -118,10 +113,10 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
         show_context: cli.show_context,
     };
 
-    // Validate: wait / file are exclusive; delete may be combined with compact.
+    // Validate: wait / file are exclusive
     let special_modes = u8::from(cli.wait)
         + u8::from(cli.file.is_some())
-        + u8::from(cli.delete || cli.compact);
+        + u8::from(cli.delete);
     if special_modes > 1 {
         bail!("multiple operation modes detected");
     }
@@ -145,17 +140,6 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    // -c without -d: compact property area memory.
-    // When a positional argument is given, treat it as a SELinux context name.
-    if cli.compact && !cli.delete {
-        let context = cli.name.as_deref();
-        let compacted = sys_prop::compact(context).context("compact failed")?;
-        if !compacted {
-            bail!("nothing to compact");
-        }
-        return Ok(());
-    }
-
     // -f: load from file
     if let Some(path) = &cli.file {
         let file = File::open(path).with_context(|| format!("Failed to open {path}"))?;
@@ -174,10 +158,6 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
         let deleted = rp.delete(name).context("delete failed")?;
         if !deleted {
             bail!("{name} not found");
-        }
-        if cli.compact {
-            let context = sys_prop::get_context(name).context("resolve context failed")?;
-            let _ = sys_prop::compact(Some(&context)).context("compact failed")?;
         }
         return Ok(());
     }

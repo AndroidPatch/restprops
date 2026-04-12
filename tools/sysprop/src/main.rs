@@ -11,7 +11,6 @@
 //! sysprop del <KEY> [--persistent]
 //! sysprop list [--context <CTX>] [--show-context] [--error-output <auto|on|off>] [--persistent]
 //! sysprop scan [--context <CTX>] [--objects] [--error-output <auto|on|off>]
-//! sysprop compact [--context <CTX>] [--error-output <auto|on|off>]
 //! sysprop persistent-file [--path <FILE>] { get | set | del | list }
 //! sysprop getcontext <KEY>
 //! sysprop dump-context <CONTEXT>
@@ -26,7 +25,6 @@
 //! sysprop area { --context <CTX> | --path <FILE> } del <KEY>
 //! sysprop area { --context <CTX> | --path <FILE> } list
 //! sysprop area { --context <CTX> | --path <FILE> } scan [--objects]
-//! sysprop area { --context <CTX> | --path <FILE> } prune-node <KEY>
 //! ```
 //!
 //! # Global options
@@ -47,8 +45,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 
 use prop_rs::{
-    CompactResult, PersistentPropertyFile, PropArea, PropAreaAllocationScan, PropAreaError,
-    PropAreaObjectKind, PropertyContext, PruneNodeResult, ANDROID_PERSISTENT_PROP_FILE,
+    PersistentPropertyFile, PropArea, PropAreaAllocationScan, PropAreaError,
+    PropAreaObjectKind, PropertyContext, ANDROID_PERSISTENT_PROP_FILE,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -142,18 +140,6 @@ enum Commands {
         objects: bool,
 
         /// Controls aggregated error output while scanning multiple prop areas.
-        /// `auto` = disabled on Android targets, enabled elsewhere.
-        #[arg(long, value_enum, default_value_t = ErrorOutputMode::Auto)]
-        error_output: ErrorOutputMode,
-    },
-
-    /// Compact prop areas across every context.
-    Compact {
-        /// Only compact this SELinux context.
-        #[arg(long)]
-        context: Option<String>,
-
-        /// Controls aggregated error output while compacting multiple prop areas.
         /// `auto` = disabled on Android targets, enabled elsewhere.
         #[arg(long, value_enum, default_value_t = ErrorOutputMode::Auto)]
         error_output: ErrorOutputMode,
@@ -309,9 +295,6 @@ enum AreaCommand {
     Del {
         /// Property name.
         key: String,
-        /// After deleting, compact the allocation space to reclaim holes.
-        #[arg(long)]
-        compact: bool,
     },
 
     /// List all properties in this area.
@@ -322,16 +305,6 @@ enum AreaCommand {
         /// Print detailed object list in addition to holes.
         #[arg(long)]
         objects: bool,
-    },
-
-    /// Compact the prop area, eliminating holes left by deleted properties.
-    Compact,
-
-    /// Prune one empty trie node by full path key (segment node).
-    #[command(name = "prune-node")]
-    PruneNode {
-        /// Full path key to the trie node, e.g. `ro.boot.selinux`.
-        key: String,
     },
 }
 
@@ -480,18 +453,6 @@ fn open_area_rw(path: &Path) -> AppResult<MmapRwArea> {
     let map = unsafe { MmapOptions::new().map_mut(&f) }
         .map_err(|e| format!("{}: {e}", path.display()))?;
     PropArea::new(MmapCursor::new(map)).map_err(prop_area_err)
-}
-
-/// Open a prop area file read-write while preserving whether the failure came
-/// from the file open itself or from parsing the prop area contents.
-fn open_area_rw_detailed(path: &Path) -> Result<MmapRwArea, OpenAreaDetailedError> {
-    let f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(OpenAreaDetailedError::Io)?;
-    let map = unsafe { MmapOptions::new().map_mut(&f) }.map_err(OpenAreaDetailedError::Io)?;
-    PropArea::new(MmapCursor::new(map)).map_err(OpenAreaDetailedError::Parse)
 }
 
 fn default_persistent_prop_path() -> &'static Path {
@@ -702,37 +663,6 @@ fn cmd_area_scan(area_path: &Path, show_objects: bool) -> AppResult<()> {
     Ok(())
 }
 
-fn compact_result_summary(result: &CompactResult) -> String {
-    match result {
-        CompactResult::NoHoles => "no holes found, area is already fully packed".to_string(),
-        CompactResult::AdjustedBytesUsed { old, new } => format!(
-            "reclaimed trailing hole — bytes_used {} → {} (freed {})",
-            old,
-            new,
-            old - new,
-        ),
-        CompactResult::MovedObjects {
-            old,
-            new,
-            objects_moved,
-        } => format!(
-            "moved {} object(s) — bytes_used {} → {} (freed {})",
-            objects_moved,
-            old,
-            new,
-            old - new,
-        ),
-    }
-}
-
-fn cmd_area_compact(area_path: &Path) -> AppResult<()> {
-    let mut area = open_area_rw(area_path)?;
-    let result = area.compact_allocations().map_err(prop_area_err)?;
-    area.into_inner().flush().map_err(|e| path_io_err(area_path, e))?;
-    eprintln!("compact: {}", compact_result_summary(&result));
-    Ok(())
-}
-
 fn cmd_scan(
     props_dir: Option<&Path>,
     system_root: Option<&Path>,
@@ -785,72 +715,6 @@ fn cmd_scan(
 
         println!("# context: {ctx_label}  |  file: {}", path.display());
         print_allocation_scan(&report, show_objects);
-    }
-
-    if !specific_context {
-        print_multi_area_error_summary(
-            emit_error_output,
-            skipped_permission_denied,
-            skipped_missing,
-            &other_errors,
-        );
-    }
-
-    Ok(())
-}
-
-fn cmd_compact(
-    props_dir: Option<&Path>,
-    system_root: Option<&Path>,
-    filter_context: Option<&str>,
-    error_output: ErrorOutputMode,
-) -> AppResult<()> {
-    let pc = load_context(props_dir, system_root)?;
-    let specific_context = filter_context.is_some();
-    let emit_error_output = error_output.enabled();
-    let targets = resolve_context_targets(&pc, filter_context)?;
-
-    let mut skipped_permission_denied = 0usize;
-    let mut skipped_missing = 0usize;
-    let mut other_errors = Vec::new();
-
-    for (ctx_label, path) in &targets {
-        let mut area = match open_area_rw_detailed(path) {
-            Ok(area) => area,
-            Err(error) => {
-                record_area_open_error(
-                    path,
-                    error,
-                    specific_context,
-                    &mut skipped_permission_denied,
-                    &mut skipped_missing,
-                    &mut other_errors,
-                )?;
-                continue;
-            }
-        };
-
-        let result = match area.compact_allocations() {
-            Ok(result) => result,
-            Err(err) => {
-                let message = format!("{}: {err}", path.display());
-                if specific_context {
-                    return Err(message.into());
-                }
-                other_errors.push(message);
-                continue;
-            }
-        };
-
-        if let Err(err) = area.into_inner().flush() {
-            if specific_context {
-                return Err(path_io_err(path, err));
-            }
-            other_errors.push(format!("{}: {err}", path.display()));
-            continue;
-        }
-
-        eprintln!("[{ctx_label}] {}", compact_result_summary(&result));
     }
 
     if !specific_context {
@@ -1195,15 +1059,12 @@ fn cmd_area(props_dir: Option<&Path>, system_root: Option<&Path>, args: &AreaArg
             area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))?;
         }
 
-        AreaCommand::Del { key, compact } => {
+        AreaCommand::Del { key } => {
             let mut area = open_area_rw(&area_path)?;
             let deleted = area.delete_property(key).map_err(prop_area_err)?;
             if !deleted {
                 eprintln!("{key}: property not found");
                 process::exit(1);
-            }
-            if *compact {
-                area.compact_allocations().map_err(prop_area_err)?;
             }
             area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))?;
         }
@@ -1235,27 +1096,6 @@ fn cmd_area(props_dir: Option<&Path>, system_root: Option<&Path>, args: &AreaArg
 
         AreaCommand::Scan { objects } => {
             cmd_area_scan(&area_path, *objects)?;
-        }
-
-        AreaCommand::Compact => {
-            cmd_area_compact(&area_path)?;
-        }
-
-        AreaCommand::PruneNode { key } => {
-            let mut area = open_area_rw(&area_path)?;
-            match area.prune_trie_node(key).map_err(prop_area_err)? {
-                PruneNodeResult::Pruned => {
-                    area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))?;
-                }
-                PruneNodeResult::NotFound => {
-                    eprintln!("{key}: trie node not found");
-                    process::exit(1);
-                }
-                PruneNodeResult::NotPrunable => {
-                    eprintln!("{key}: trie node is not empty (has value or children)");
-                    process::exit(2);
-                }
-            }
         }
     }
     Ok(())
@@ -1308,10 +1148,6 @@ fn run() -> AppResult<()> {
             *objects,
             *error_output,
         ),
-        Commands::Compact {
-            context,
-            error_output,
-        } => cmd_compact(props_dir, system_root, context.as_deref(), *error_output),
         Commands::Getcontext { key } => cmd_getcontext(props_dir, system_root, key),
         Commands::DumpContext { context } => cmd_dump_context(props_dir, system_root, context),
         Commands::ListContexts { existing_only } => {

@@ -226,10 +226,6 @@ impl CachedPropertyContext {
         self.ctx.get_context_for_name(name)
     }
 
-    fn prop_area_files(&self) -> io::Result<Vec<(String, PathBuf)>> {
-        self.ctx.prop_area_files()
-    }
-
     fn map_context_area(&self, context: &str) -> SysPropResult<MmapPropArea> {
         let path = self.ctx.context_file_path(context);
         let f = OpenOptions::new().read(true).write(true).open(&path)?;
@@ -645,61 +641,6 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
     }
 
     Ok(deleted)
-}
-
-/// Compact prop area files, reclaiming holes left by deletions.
-///
-/// When `context` is `Some`, only the prop area for that SELinux context is
-/// compacted; when `None`, all prop areas (including appcompat_override) are
-/// compacted.
-///
-/// Returns `true` if any area was compacted.
-pub fn compact(context: Option<&str>) -> SysPropResult<bool> {
-    let mut any_compacted = false;
-
-    // Compact main property areas.
-    let ctx = prop_ctx()?;
-    any_compacted |= compact_areas(ctx, context)?;
-
-    // Compact appcompat_override areas (Android 14+).
-    if let Some(appcompat) = appcompat_ctx() {
-        any_compacted |= compact_areas(appcompat, context)?;
-    }
-
-    Ok(any_compacted)
-}
-
-fn compact_areas(ctx: &CachedPropertyContext, filter: Option<&str>) -> SysPropResult<bool> {
-    // Helper: compact one prop-area file via MAP_SHARED mmap.
-    fn compact_one(path: &std::path::Path) -> io::Result<bool> {
-        let f = OpenOptions::new().read(true).write(true).open(path)?;
-        let mut map = unsafe { MmapOptions::new().map_mut(&f) }?;
-        let cursor = Cursor::new(&mut map[..]);
-        let mut area =
-            PropArea::new(cursor).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let result = area
-            .compact_allocations()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        Ok(!matches!(result, prop_rs::CompactResult::NoHoles))
-    }
-
-    let mut any_compacted = false;
-
-    if let Some(context) = filter {
-        let path = ctx.ctx.context_file_path(context);
-        if let Ok(changed) = compact_one(&path) {
-            any_compacted |= changed;
-        }
-    } else {
-        let targets = ctx.prop_area_files().map_err(SysPropError::Io)?;
-        for (_context, path) in &targets {
-            if let Ok(changed) = compact_one(path) {
-                any_compacted |= changed;
-            }
-        }
-    }
-
-    Ok(any_compacted)
 }
 
 /// Wait for a property to exist or change away from a given value.

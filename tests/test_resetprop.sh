@@ -688,90 +688,29 @@ else
 fi
 
 # ============================================================================
-# 测试组 10: 压缩 (-c)
+# 测试组 10: 写入痕迹检查
 # ============================================================================
 
-section "10. 压缩 (-c)"
+section "10. 写入痕迹检查"
 
-# 10.1 先制造一些碎片再压缩
-rp_set -n "${TEST_PREFIX}.compact1" "data1"
-rp_set -n "${TEST_PREFIX}.compact2" "data2"
-rp_set -n "${TEST_PREFIX}.compact3" "data3"
-$RESETPROP -d "${TEST_PREFIX}.compact1" >/dev/null 2>&1
-$RESETPROP -d "${TEST_PREFIX}.compact2" >/dev/null 2>&1
-
-$RESETPROP -c >/dev/null 2>&1
-rc=$?
-if [ $rc -eq 0 ]; then
-    log_pass "10.1 压缩成功（有数据被回收）"
-elif [ $rc -eq 1 ]; then
-    log_pass "10.1 压缩完成（无需回收）"
-else
-    log_fail "10.1 压缩操作" "exit=0 or 1" "exit=$rc"
-fi
-
-# 10.2 压缩后属性仍可读
-val=$(rp_get "${TEST_PREFIX}.compact3")
-assert_eq "10.2 压缩后属性仍可读" "data3" "$val"
-
-# 10.3 指定 context 压缩
-$RESETPROP -d "${TEST_PREFIX}.compact3" >/dev/null 2>&1
-$RESETPROP -c "u:object_r:default_prop:s0" >/dev/null 2>&1
-rc=$?
-if [ $rc -eq 0 ] || [ $rc -eq 1 ]; then
-    log_pass "10.3 指定 context 压缩成功"
-else
-    log_fail "10.3 指定 context 压缩" "exit=0 or 1" "exit=$rc"
-fi
-
-# ============================================================================
-# 测试组 10A: 写入痕迹检查
-# ============================================================================
-
-section "10A. 写入痕迹检查"
-
-# 10A.1 inline 值缩短后尾部不应残留非零字节
-assert_success "10A.1a 设置较长 inline 值" rp_set -n "${TEST_PREFIX}.trace_inline" "abcdefgh"
-assert_success "10A.1b 将 inline 值缩短" rp_set -n "${TEST_PREFIX}.trace_inline" "abc"
+# 10.1 inline 值缩短后尾部不应残留非零字节
+assert_success "10.1a 设置较长 inline 值" rp_set -n "${TEST_PREFIX}.trace_inline" "abcdefgh"
+assert_success "10.1b 将 inline 值缩短" rp_set -n "${TEST_PREFIX}.trace_inline" "abc"
 val=$(rp_get "${TEST_PREFIX}.trace_inline")
-assert_eq "10A.1c 缩短后读取值正确" "abc" "$val"
+assert_eq "10.1c 缩短后读取值正确" "abc" "$val"
 slot_info=$(rp_test --inspect-slot "${TEST_PREFIX}.trace_inline")
-assert_contains "10A.1d inspect 识别为 inline" "layout=inline" "$slot_info"
-assert_contains "10A.1e inline 尾部无非零字节" "tail_nonzero=0" "$slot_info"
+assert_contains "10.1d inspect 识别为 inline" "layout=inline" "$slot_info"
+assert_contains "10.1e inline 尾部无非零字节" "tail_nonzero=0" "$slot_info"
 
-# 10A.2 delete 产生 hole，compact 后 hole 应消失
-hole_context=$(rp_get -Z "${TEST_PREFIX}.hole.bb")
-if [ -n "$hole_context" ]; then
-    $RESETPROP -c "$hole_context" >/dev/null 2>&1
-    baseline_scan=$(rp_test --scan "${TEST_PREFIX}.hole.bb")
-    assert_contains "10A.2a 基线 scan 无 hole" "holes=0" "$baseline_scan"
-
-    assert_success "10A.2b 设置 hole.aa" rp_set -n "${TEST_PREFIX}.hole.aa" "value_aa"
-    assert_success "10A.2c 设置 hole.bb" rp_set -n "${TEST_PREFIX}.hole.bb" "value_bb"
-    assert_success "10A.2d 删除 hole.aa" $RESETPROP -d "${TEST_PREFIX}.hole.aa"
-
-    hole_scan=$(rp_test --scan "${TEST_PREFIX}.hole.bb")
-    assert_not_contains "10A.2e 删除后 scan 出现 hole" "holes=0" "$hole_scan"
-
-    $RESETPROP -c "$hole_context" >/dev/null 2>&1
-    compact_scan=$(rp_test --scan "${TEST_PREFIX}.hole.bb")
-    assert_contains "10A.2f compact 后 hole 消失" "holes=0" "$compact_scan"
-
-    val=$(rp_get "${TEST_PREFIX}.hole.bb")
-    assert_eq "10A.2g compact 后剩余属性仍可读" "value_bb" "$val"
-else
-    log_fail "10A.2 hole 测试获取 context" "non-empty context" "(empty)"
-fi
-
-# 10A.3 prop area 文件 mtime/ctime 在写入前后不应改变
+# 10.2 prop area 文件 mtime/ctime 在写入前后不应改变
 area_path=$(rp_test --area-path "${TEST_PREFIX}.mtime")
 if [ -n "$area_path" ] && [ -e "$area_path" ]; then
     stat_before=$(stat_times "$area_path")
-    assert_success "10A.3a 执行 direct mmap 写入" rp_set -n "${TEST_PREFIX}.mtime" "mtime_check"
+    assert_success "10.2a 执行 direct mmap 写入" rp_set -n "${TEST_PREFIX}.mtime" "mtime_check"
     stat_after=$(stat_times "$area_path")
-    assert_eq "10A.3b prop area 的 mtime/ctime 未变化" "$stat_before" "$stat_after"
+    assert_eq "10.2b prop area 的 mtime/ctime 未变化" "$stat_before" "$stat_after"
 else
-    log_fail "10A.3 prop area 路径解析" "existing path" "${area_path:-<empty>}"
+    log_fail "10.2 prop area 路径解析" "existing path" "${area_path:-<empty>}"
 fi
 
 # ============================================================================
