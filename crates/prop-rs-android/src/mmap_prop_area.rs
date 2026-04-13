@@ -164,8 +164,8 @@ impl MmapPropArea {
         let header_size = PROP_AREA_HEADER_SIZE as usize;
         let data_size = (pa_size - header_size) as u32;
 
-        let magic = unsafe { atomic_load_u32_relaxed(map.as_ptr(), 8) };
-        let version = unsafe { atomic_load_u32_relaxed(map.as_ptr(), 12) };
+        let magic = unsafe { atomic_load_u32(map.as_ptr(), 8, Ordering::Relaxed) };
+        let version = unsafe { atomic_load_u32(map.as_ptr(), 12, Ordering::Relaxed) };
 
         if magic != PROP_AREA_MAGIC {
             return Err(MmapPropAreaError::InvalidMagic(magic));
@@ -198,12 +198,12 @@ impl MmapPropArea {
     }
 
     fn read_bytes_used(&self) -> u32 {
-        unsafe { atomic_load_u32_relaxed(self.as_ptr(), PA_BYTES_USED_OFF) }
+        unsafe { atomic_load_u32(self.as_ptr(), PA_BYTES_USED_OFF, Ordering::Relaxed) }
     }
 
     fn write_bytes_used(&mut self, val: u32) {
         // bytes_used_ is written only by the single writer; Relaxed is fine.
-        unsafe { atomic_store_u32_relaxed(self.as_mut_ptr(), PA_BYTES_USED_OFF, val) };
+        unsafe { atomic_store_u32(self.as_mut_ptr(), PA_BYTES_USED_OFF, val, Ordering::Relaxed) };
     }
 
     // ── prop_info serial field accessors ────────────────────────────────────
@@ -216,7 +216,7 @@ impl MmapPropArea {
 
     /// Read the serial field of a prop_info atomically with Relaxed ordering.
     unsafe fn read_pi_serial_relaxed(&self, data_off: u32) -> u32 {
-        atomic_load_u32_relaxed(self.as_ptr(), self.serial_abs_off(data_off))
+        atomic_load_u32(self.as_ptr(), self.serial_abs_off(data_off), Ordering::Relaxed)
     }
 
     /// Atomically store `serial` into `prop_info::serial` with Relaxed ordering.
@@ -224,10 +224,10 @@ impl MmapPropArea {
     /// # Safety
     /// `data_off` must be a valid data offset for a `prop_info` record.
     pub unsafe fn store_pi_serial_relaxed(&mut self, data_off: u32, serial: u32) {
-        atomic_store_u32_relaxed(
+        atomic_store_u32(
             self.as_mut_ptr(),
             self.serial_abs_off(data_off),
-            serial,
+            serial, Ordering::Relaxed
         );
     }
 
@@ -886,8 +886,8 @@ impl MmapPropArea {
     /// Must only be called by the single writer.
     pub fn bump_area_serial_and_wake(&mut self) {
         unsafe {
-            let old = atomic_load_u32_relaxed(self.as_ptr(), PA_SERIAL_OFF);
-            atomic_store_u32_release(self.as_mut_ptr(), PA_SERIAL_OFF, old.wrapping_add(1));
+            let old = atomic_load_u32(self.as_ptr(), PA_SERIAL_OFF, Ordering::Relaxed);
+            atomic_store_u32(self.as_mut_ptr(), PA_SERIAL_OFF, old.wrapping_add(1), Ordering::Release);
             futex_wake(self.as_ptr().add(PA_SERIAL_OFF) as *const u32);
         }
     }
@@ -948,37 +948,26 @@ pub fn compose_hidden_serial(serial_dirty: u32, serial_len: u32, is_long: bool) 
 
 // ── Low-level atomic / futex utilities ───────────────────────────────────────
 
-/// Atomically load a `u32` at `base + abs_off` with Relaxed ordering.
+/// Atomically load a `u32` at `base + abs_off` with given ordering.
 ///
 /// # Safety
 ///
 /// `base + abs_off` must be 4-byte aligned and within a valid mapping.
 #[inline]
-unsafe fn atomic_load_u32_relaxed(base: *const u8, abs_off: usize) -> u32 {
+unsafe fn atomic_load_u32(base: *const u8, abs_off: usize, order: Ordering) -> u32 {
     let ptr = base.add(abs_off) as *const AtomicU32;
-    (*ptr).load(Ordering::Relaxed)
+    (*ptr).load(order)
 }
 
-/// Atomically store `val` at `base + abs_off` with Relaxed ordering.
+/// Atomically store `val` at `base + abs_off` with given ordering.
 ///
 /// # Safety
 ///
 /// `base + abs_off` must be 4-byte aligned and within a valid mapping.
 #[inline]
-unsafe fn atomic_store_u32_relaxed(base: *mut u8, abs_off: usize, val: u32) {
+unsafe fn atomic_store_u32(base: *mut u8, abs_off: usize, val: u32, order: Ordering) {
     let ptr = base.add(abs_off) as *mut AtomicU32;
-    (*ptr).store(val, Ordering::Relaxed);
-}
-
-/// Atomically store `val` at `base + abs_off` with Release ordering.
-///
-/// # Safety
-///
-/// `base + abs_off` must be 4-byte aligned and within a valid mapping.
-#[inline]
-unsafe fn atomic_store_u32_release(base: *mut u8, abs_off: usize, val: u32) {
-    let ptr = base.add(abs_off) as *mut AtomicU32;
-    (*ptr).store(val, Ordering::Release);
+    (*ptr).store(val, order);
 }
 
 /// Issue a futex wake for all threads waiting on `addr`.
