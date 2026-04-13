@@ -33,11 +33,13 @@
 //! inherently unsafe but are guaranteed to be correct given the layout
 //! invariants of bionic's prop_area format.
 
+use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::fmt;
+use std::ops::Add;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
 
-use memmap2::MmapMut;
+use memmap2::{Mmap, MmapMut};
 use prop_rs::{
     AREA_SERIAL_OFFSET, PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC, PROP_AREA_VERSION, PROP_VALUE_MAX,
 };
@@ -85,6 +87,7 @@ const TRIE_LEFT_OFF: u32 = 8;
 const TRIE_RIGHT_OFF: u32 = 12;
 /// Byte offset of `prop_trie_node::children` within the fixed header.
 const TRIE_CHILDREN_OFF: u32 = 16;
+const TRIE_SIZE: u32 = 20;
 
 /// `bytes_used_` in `prop_area` is initialised to sizeof(prop_trie_node) +
 /// ALIGN(PROP_VALUE_MAX, 4) to reserve room for the dirty-backup area.
@@ -106,8 +109,11 @@ pub enum MmapPropAreaError {
     InvalidVersion(u32),
     InvalidOffset(u32),
     InvalidKey,
+    InvalidValue,
+    InvalidSize(String, usize),
     AreaFull,
     ValueTooLong { len: usize },
+    MapAreaFailed,
 }
 
 impl fmt::Display for MmapPropAreaError {
@@ -117,10 +123,13 @@ impl fmt::Display for MmapPropAreaError {
             Self::InvalidVersion(v) => write!(f, "invalid prop area version: 0x{v:08x}"),
             Self::InvalidOffset(o) => write!(f, "invalid data offset: {o}"),
             Self::InvalidKey => write!(f, "invalid property key"),
+            Self::InvalidValue => write!(f, "invalid property value"),
+            Self::InvalidSize(s, sz) => write!(f, "invalid size: {s} {sz}"),
             Self::AreaFull => write!(f, "prop area is full"),
             Self::ValueTooLong { len } => {
                 write!(f, "value length {len} >= PROP_VALUE_MAX for mutable property")
-            }
+            },
+            Self::MapAreaFailed => write!(f, "map area failed"),
         }
     }
 }
@@ -137,6 +146,19 @@ pub struct ValueSlotInspect {
     pub tail_nonzero: usize,
 }
 
+struct ReadPropResult {
+    name: String,
+    value: Vec<u8>,
+    serial_counter: u32,
+    offset: u32,
+}
+
+struct PropTrieInfo {
+    left: u32,
+    right: u32,
+    children: u32,
+    prop: u32,
+}
 
 // ── MmapPropArea ─────────────────────────────────────────────────────────────
 
@@ -162,6 +184,9 @@ impl MmapPropArea {
     pub fn new(map: MmapMut) -> MmapResult<Self> {
         let pa_size = map.len();
         let header_size = PROP_AREA_HEADER_SIZE as usize;
+        if pa_size < header_size {
+            return Err(MmapPropAreaError::InvalidSize("pa_size".into(), pa_size))
+        }
         let data_size = (pa_size - header_size) as u32;
 
         let magic = unsafe { atomic_load_u32(map.as_ptr(), 8, Ordering::Relaxed) };
@@ -175,6 +200,100 @@ impl MmapPropArea {
         }
 
         Ok(Self { map, pa_size, data_size })
+    }
+
+    pub fn new_anon_from(r: &Self) -> MmapResult<Self> {
+        let mut new_map = MmapMut::map_anon(r.pa_size).map_err(|_| MmapPropAreaError::MapAreaFailed)?;
+
+        unsafe {
+            (new_map.as_mut_ptr().add(8) as *mut u32).write(PROP_AREA_MAGIC);
+            (new_map.as_mut_ptr().add(12) as *mut u32).write(PROP_AREA_VERSION);
+            (new_map.as_mut_ptr().add(PA_BYTES_USED_OFF) as *mut u32).write(if r.has_dirty_backup()? { TRIE_SIZE + PROP_VALUE_MAX as u32 } else { TRIE_SIZE })
+        }
+
+        Self::new(new_map)
+    }
+
+    fn read_prop_trie(&self, offset: u32) -> MmapResult<PropTrieInfo> {
+        let abs = PROP_AREA_HEADER_SIZE as u32 + offset;
+        let max_off = self.read_bytes_used().add(PROP_AREA_HEADER_SIZE as u32).min(self.pa_size as u32);
+
+        if abs > max_off || abs + TRIE_SIZE > max_off {
+            return Err(MmapPropAreaError::InvalidOffset(abs));
+        }
+
+        unsafe {
+            Ok(PropTrieInfo { 
+                left: self.read_u32_data(abs + TRIE_LEFT_OFF)?, 
+                right: self.read_u32_data(abs + TRIE_RIGHT_OFF)?, 
+                children: self.read_u32_data(abs + TRIE_CHILDREN_OFF)?, 
+                prop: self.read_u32_data(abs + TRIE_PROP_OFF)?, 
+            })
+        }
+    }
+
+    fn has_dirty_backup(&self) -> MmapResult<bool> {
+        let root = self.read_prop_trie(0)?;
+
+        if root.children != 0 && root.children == TRIE_SIZE {
+            return Ok(false);
+        }
+
+        if root.children == 0 {
+            return Ok(self.read_bytes_used() as usize == 112);
+        }
+
+        Ok(true)
+    }
+
+    /// Insert properties from another area
+    pub fn fill_prop_from(&mut self, another: &Self) -> MmapResult<()> {
+        let mut props = BTreeMap::<u32, ReadPropResult>::new();
+
+        self.for_each_property_info_offset(0, |off| -> MmapResult<()> {
+            props.insert(off, another.read_prop_info(off)?);
+            Ok(())
+        })?;
+
+        for (_, prop) in props {
+            self.emplace(&prop.name, &prop.value, prop.serial_counter)?;
+        }
+
+        Ok(())
+    }
+
+    /// Replace current area with another's content
+    pub fn replace_with_area(&mut self, another: &Self) -> MmapResult<()> {
+        unsafe {
+            let old_size = self.read_bytes_used() as usize + PROP_AREA_HEADER_SIZE as usize;
+            let new_size = another.read_bytes_used() as usize + PROP_AREA_HEADER_SIZE as usize;
+            core::ptr::copy(another.as_ptr(), self.as_mut_ptr(), new_size);
+            if old_size > new_size {
+                core::ptr::write_bytes(self.as_mut_ptr().add(new_size), 0, old_size - new_size);
+            }
+        }
+        Ok(())
+    }
+
+    fn for_each_property_info_offset<F: FnMut(u32) -> MmapResult<()>>(&self, from: u32, mut f: F) -> MmapResult<()> {
+        self.for_each_property_info_offset_inner(from, &mut f)
+    }
+
+    fn for_each_property_info_offset_inner<F: FnMut(u32) -> MmapResult<()>>(&self, from: u32, f: &mut F) -> MmapResult<()> {
+        let node = self.read_prop_trie(from)?;
+        if node.prop != 0 {
+            f(node.prop)?;
+        }
+        if node.children != 0 {
+            self.for_each_property_info_offset_inner(node.children, f)?;
+        }
+        if node.left != 0 {
+            self.for_each_property_info_offset_inner(node.left, f)?;
+        }
+        if node.right != 0 {
+            self.for_each_property_info_offset_inner(node.right, f)?;
+        }
+        Ok(())
     }
 
     /// Raw pointer to the start of the mmap region (the `prop_area` header).
@@ -217,6 +336,11 @@ impl MmapPropArea {
     /// Read the serial field of a prop_info atomically with Relaxed ordering.
     unsafe fn read_pi_serial_relaxed(&self, data_off: u32) -> u32 {
         atomic_load_u32(self.as_ptr(), self.serial_abs_off(data_off), Ordering::Relaxed)
+    }
+
+    /// Read the serial field of a prop_info atomically with Relaxed ordering.
+    unsafe fn read_pi_serial(&self, data_off: u32, order: Ordering) -> u32 {
+        atomic_load_u32(self.as_ptr(), self.serial_abs_off(data_off), order)
     }
 
     /// Atomically store `serial` into `prop_info::serial` with Relaxed ordering.
@@ -278,19 +402,47 @@ impl MmapPropArea {
     }
 
     /// Read a C-string from data space into a `String`.
-    unsafe fn read_cstr_data(&self, data_off: u32, max_len: usize) -> Option<String> {
+    unsafe fn read_cstr_data(&self, data_off: u32) -> MmapResult<String> {
         let abs = PROP_AREA_HEADER_SIZE as usize + data_off as usize;
         if abs >= self.pa_size {
-            return None;
+            return Err(MmapPropAreaError::InvalidOffset(data_off));
         }
         let slice = std::slice::from_raw_parts(
             self.as_ptr().add(abs),
-            (self.pa_size - abs).min(max_len + 1),
+            self.pa_size - abs
         );
         CStr::from_bytes_until_nul(slice)
-            .ok()
-            .and_then(|c| c.to_str().ok())
+            .map_err(|_| MmapPropAreaError::InvalidKey)
+            .and_then(|c| c.to_str().map_err(|_| MmapPropAreaError::InvalidKey))
             .map(|s| s.to_owned())
+    }
+
+    unsafe fn read_data(&self, data_off: u32, size: u32) -> MmapResult<&[u8]> {
+        let abs = PROP_AREA_HEADER_SIZE as usize + data_off as usize;
+        if abs >= self.pa_size {
+            return Err(MmapPropAreaError::InvalidOffset(data_off));
+        }
+        if abs + size as usize >= self.pa_size {
+            return Err(MmapPropAreaError::InvalidOffset(data_off + size));
+        }
+        Ok(std::slice::from_raw_parts(
+            self.as_ptr().add(abs),
+            size as usize
+        ))
+    }
+
+    unsafe fn read_zero_end_data(&self, data_off: u32) -> MmapResult<&[u8]> {
+        let abs = PROP_AREA_HEADER_SIZE as usize + data_off as usize;
+        if abs >= self.pa_size {
+            return Err(MmapPropAreaError::InvalidOffset(data_off));
+        }
+        let slice = std::slice::from_raw_parts(
+            self.as_ptr().add(abs),
+            self.pa_size - abs
+        );
+        slice.iter().position(|x| *x == 0)
+            .map(|off| &slice[..off])
+            .ok_or(MmapPropAreaError::InvalidKey)
     }
 
     // ── allocator ────────────────────────────────────────────────────────────
@@ -349,6 +501,7 @@ impl MmapPropArea {
         &mut self,
         name: &[u8],
         value: &[u8],
+        initial_serial_counter: u32,
     ) -> MmapResult<u32> {
         let total = PROP_INFO_SIZE as usize + name.len() + 1;
         let off = self.allocate(total)?;
@@ -365,7 +518,7 @@ impl MmapPropArea {
             *self.as_mut_ptr()
                 .add(PROP_AREA_HEADER_SIZE as usize + name_abs as usize + name.len()) = 0;
             // Initialise serial: valuelen << 24, Relaxed.
-            let serial = (value.len() as u32) << 24;
+            let serial = (initial_serial_counter << 1) | ((value.len() as u32) << 24);
             self.store_pi_serial_relaxed(off, serial);
         }
         Ok(off)
@@ -382,6 +535,7 @@ impl MmapPropArea {
         &mut self,
         name: &[u8],
         value: &[u8],
+        initial_serial_counter: u32,
     ) -> MmapResult<u32> {
         // Allocate prop_info + name.
         let pi_total = PROP_INFO_SIZE as usize + name.len() + 1;
@@ -418,7 +572,7 @@ impl MmapPropArea {
 
             // Initialise serial.
             let error_val_len = LONG_LEGACY_ERROR.len() as u32;
-            let serial = (error_val_len << 24) | PROP_INFO_LONG_FLAG;
+            let serial = (error_val_len << 24) | PROP_INFO_LONG_FLAG | (initial_serial_counter << 1);
             self.store_pi_serial_relaxed(pi_off, serial);
         }
         Ok(pi_off)
@@ -551,34 +705,67 @@ impl MmapPropArea {
         }
     }
 
-    /// Read the name and value of a `prop_info` at data-space `data_off`.
-    ///
-    /// Returns `None` when the offset is invalid.
-    pub fn read_prop(&self, data_off: u32) -> Option<(String, String)> {
+    fn read_prop_info(&self, data_off: u32) -> MmapResult<ReadPropResult> {
+        let name = unsafe { self.read_cstr_data(data_off + PROP_INFO_SIZE)? };
+
+        if name.starts_with("ro.") {
+            self.read_immutable_prop(name, data_off)
+        } else {
+            self.read_mutable_prop(name, data_off)
+        }
+    }
+
+    /// Read the mutable `prop_info` at data-space `data_off`.
+    fn read_mutable_prop(&self, name: String, data_off: u32) -> MmapResult<ReadPropResult> {
         unsafe {
-            let serial = self.read_pi_serial_relaxed(data_off);
-            let is_long = (serial & PROP_INFO_LONG_FLAG) != 0;
-            let name_off = data_off + PROP_INFO_SIZE;
+            let mut new_serial = self.read_pi_serial(data_off, Ordering::Acquire);
+            let mut serial: u32;
+            let mut len: u32;
+            let mut data: Vec<u8>;
+            loop {
+                serial = new_serial;
+                len = serial >> 24;
+                if (serial & 1) != 0 {
+                    futex_wait(self.as_ptr().add(self.serial_abs_off(data_off)) as *const u32, serial);
+                    new_serial = self.read_pi_serial(data_off, Ordering::Relaxed);
+                    continue;
+                } else {
+                    data = self.read_data(data_off + PROP_INFO_VALUE_OFF, len)?.into();
+                }
+                fence(Ordering::Acquire);
+                new_serial = self.read_pi_serial(data_off, Ordering::Relaxed);
+                if new_serial == serial {
+                    break;
+                }
+                fence(Ordering::Acquire);
+            }
 
-            let name = self.read_cstr_data(name_off, 256)?;
+            Ok(ReadPropResult { 
+                name,
+                value: data, 
+                serial_counter: (serial & 0x00ff_ffff) >> 1, 
+                offset: data_off 
+            })
+        }
+    }
 
-            let value = if is_long {
-                let loff = self.read_u32_data(data_off + PROP_INFO_LONG_OFFSET_OFF).ok()?;
-                // loff is relative from prop_info start
-                self.read_cstr_data(data_off + loff, 1024)?
+    /// Read the read-only `prop_info` at data-space `data_off`.
+    fn read_immutable_prop(&self, name: String, data_off: u32) -> MmapResult<ReadPropResult> {
+        unsafe {
+            let serial = self.read_pi_serial(data_off, Ordering::Relaxed);
+            let data: Vec<u8> = if (serial & PROP_INFO_LONG_FLAG) != 0 {
+                let long_prop_off = self.read_u32_data(data_off + PROP_INFO_LONG_OFFSET_OFF)?;
+                self.read_zero_end_data(data_off + long_prop_off)?.into()
             } else {
-                let val_len = (serial >> 24) as usize;
-                let val_abs = (PROP_AREA_HEADER_SIZE as usize)
-                    + data_off as usize
-                    + PROP_INFO_VALUE_OFF as usize;
-                let slice = std::slice::from_raw_parts(
-                    self.as_ptr().add(val_abs),
-                    val_len.min(PROP_VALUE_MAX),
-                );
-                String::from_utf8_lossy(slice).into_owned()
+                self.read_data(data_off + PROP_INFO_VALUE_OFF, serial >> 24)?.into()
             };
 
-            Some((name, value))
+            Ok(ReadPropResult {
+                name,
+                value: data,
+                serial_counter: (serial & 0x00ff_ffff & !PROP_INFO_LONG_FLAG) >> 1, // should be 0, but still read it
+                offset: data_off
+            })
         }
     }
 
@@ -635,6 +822,34 @@ impl MmapPropArea {
     /// Add a new property and publish serial changes using bionic's writer protocol.
     ///
     /// If the property already exists its value is updated via [`Self::update`].
+    pub fn emplace(
+        &mut self,
+        name: &str,
+        value: &[u8],
+        serial_counter: u32
+    ) -> MmapResult<()> {
+        let name_b = name.as_bytes();
+
+        let node_off = match self.traverse_trie(name_b, true)? {
+            Some(o) => o,
+            None => return Err(MmapPropAreaError::InvalidKey),
+        };
+
+        let is_long = value.len() >= PROP_VALUE_MAX;
+        let pi_off = if is_long {
+            self.new_prop_info_long(name_b, value, serial_counter)?
+        } else {
+            self.new_prop_info_inline(name_b, value, serial_counter)?
+        };
+
+        // Publish the prop_info pointer into the trie node (Release).
+        unsafe { self.store_trie_ptr(node_off, TRIE_PROP_OFF, pi_off) };
+        Ok(())
+    }
+
+    /// Add a new property and publish serial changes using bionic's writer protocol.
+    ///
+    /// If the property already exists its value is updated via [`Self::update`].
     pub fn add(
         &mut self,
         name: &str,
@@ -657,9 +872,9 @@ impl MmapPropArea {
 
         let is_long = value_b.len() >= PROP_VALUE_MAX;
         let pi_off = if is_long {
-            self.new_prop_info_long(name_b, value_b)?
+            self.new_prop_info_long(name_b, value_b, 0)?
         } else {
-            self.new_prop_info_inline(name_b, value_b)?
+            self.new_prop_info_inline(name_b, value_b, 0)?
         };
 
         // Publish the prop_info pointer into the trie node (Release).
@@ -981,6 +1196,21 @@ pub unsafe fn futex_wake(addr: *const u32) {
         addr,
         libc::FUTEX_WAKE,
         i32::MAX,
+        std::ptr::null::<libc::timespec>(),
+    );
+}
+
+/// Issue a futex wake for all threads waiting on `addr`.
+///
+/// # Safety
+///
+/// `addr` must point to a valid `u32` within a `MAP_SHARED` region.
+pub unsafe fn futex_wait(addr: *const u32, value: u32) {
+    libc::syscall(
+        libc::SYS_futex,
+        addr,
+        libc::FUTEX_WAIT,
+        value,
         std::ptr::null::<libc::timespec>(),
     );
 }
