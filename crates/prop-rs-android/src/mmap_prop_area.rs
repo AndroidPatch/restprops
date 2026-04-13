@@ -39,7 +39,7 @@ use std::fmt;
 use std::ops::Add;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
 
-use memmap2::{Mmap, MmapMut};
+use memmap2::MmapMut;
 use prop_rs::{
     AREA_SERIAL_OFFSET, PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC, PROP_AREA_VERSION, PROP_VALUE_MAX,
 };
@@ -150,7 +150,6 @@ struct ReadPropResult {
     name: String,
     value: Vec<u8>,
     serial_counter: u32,
-    offset: u32,
 }
 
 struct PropTrieInfo {
@@ -743,8 +742,7 @@ impl MmapPropArea {
             Ok(ReadPropResult { 
                 name,
                 value: data, 
-                serial_counter: (serial & 0x00ff_ffff) >> 1, 
-                offset: data_off 
+                serial_counter: (serial & 0x00ff_ffff) >> 1,
             })
         }
     }
@@ -764,7 +762,6 @@ impl MmapPropArea {
                 name,
                 value: data,
                 serial_counter: (serial & 0x00ff_ffff & !PROP_INFO_LONG_FLAG) >> 1, // should be 0, but still read it
-                offset: data_off
             })
         }
     }
