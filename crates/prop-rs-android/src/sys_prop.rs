@@ -726,6 +726,18 @@ pub fn wait(
     }
 }
 
+pub fn rebuild(context: &String) -> SysPropResult<()> {
+    let ctx = prop_ctx()?;
+    ctx.with_area_rw(context, |area| {
+        let mut anon_area = MmapPropArea::new_anon_from(area)?;
+        anon_area.fill_prop_from(area)?;
+        area.replace_with_area(&anon_area)?;
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
 // ── Internal helpers ────────────────────────────────────────────────────────
 
 fn make_cstring(s: &str) -> SysPropResult<CString> {

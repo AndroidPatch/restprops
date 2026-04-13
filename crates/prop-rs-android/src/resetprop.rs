@@ -22,6 +22,8 @@ pub struct ResetProp {
     pub verbose: bool,
     /// `-Z`: show SELinux context instead of value.
     pub show_context: bool,
+    /// `-c`: rebuild prop area (former compact)
+    pub rebuild: bool,
 }
 
 impl ResetProp {
@@ -175,5 +177,9 @@ impl ResetProp {
             self.set(key, value)?;
         }
         Ok(())
+    }
+
+    pub fn rebuild(&self, area: &String) -> SysPropResult<()> {
+        sys_prop::rebuild(area)
     }
 }

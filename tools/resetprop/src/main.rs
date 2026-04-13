@@ -69,6 +69,10 @@ struct Args {
     #[arg(short = 'Z')]
     show_context: bool,
 
+    /// Rebuild property area.
+    #[arg(short = 'c')]
+    rebuild: bool,
+
     /// Property name.
     name: Option<String>,
 
@@ -111,12 +115,14 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
         persist_only: cli.persist_only,
         verbose: cli.verbose,
         show_context: cli.show_context,
+        rebuild: cli.rebuild,
     };
 
     // Validate: wait / file are exclusive
     let special_modes = u8::from(cli.wait)
         + u8::from(cli.file.is_some())
-        + u8::from(cli.delete);
+        + u8::from(cli.delete)
+        + u8::from(cli.rebuild); // TODO: support rebuild after any write command
     if special_modes > 1 {
         bail!("multiple operation modes detected");
     }
@@ -162,6 +168,14 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    if cli.rebuild {
+        let name = cli
+            .name
+            .context("--delete requires a property area context name")?;
+        rp.rebuild(&name)?;
+        return Ok(());
+    }
+
     match (&cli.name, &cli.value) {
         // resetprop name value (set)
         (Some(name), Some(value)) => {
@@ -204,6 +218,7 @@ pub fn load_system_prop_file(path: &Path) -> Result<()> {
         persist_only: false,
         verbose: false,
         show_context: false,
+        rebuild: false,
     };
 
     let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
