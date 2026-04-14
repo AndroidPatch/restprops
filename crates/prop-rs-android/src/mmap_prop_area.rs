@@ -226,17 +226,21 @@ impl MmapPropArea {
         }
     }
 
+    /// Note: only works correctly if delete props using our implementation.
     fn has_dirty_backup(&self) -> MmapResult<bool> {
         let root = self.read_prop_trie(0)?;
 
-        if root.children != 0 && root.children == TRIE_SIZE {
+        // If the first-level root trie node is right after root node, the dirty back area doesn't exist.
+        if root.children == TRIE_SIZE {
             return Ok(false);
         }
 
+        // If the whole prop area is empty, we check its initial bytes_used_.
         if root.children == 0 {
             return Ok(self.read_bytes_used() as usize == 112);
         }
 
+        // Assume it has.
         Ok(true)
     }
 
@@ -968,70 +972,12 @@ impl MmapPropArea {
         Ok(())
     }
 
-    /// DFS prune pass used after a deletion.
-    ///
-    /// Returns `true` when `node_off` became a redundant leaf and should be
-    /// detached from its parent, matching bionic's `prune_trie` behavior.
-    fn prune_trie(&mut self, node_off: u32) -> MmapResult<bool> {
-        let mut is_leaf = true;
-
-        let children = unsafe { self.load_trie_ptr(node_off, TRIE_CHILDREN_OFF) };
-        if children != 0 {
-            if self.prune_trie(children)? {
-                unsafe { self.store_trie_ptr(node_off, TRIE_CHILDREN_OFF, 0) };
-            } else {
-                is_leaf = false;
-            }
-        }
-
-        let left = unsafe { self.load_trie_ptr(node_off, TRIE_LEFT_OFF) };
-        if left != 0 {
-            if self.prune_trie(left)? {
-                unsafe { self.store_trie_ptr(node_off, TRIE_LEFT_OFF, 0) };
-            } else {
-                is_leaf = false;
-            }
-        }
-
-        let right = unsafe { self.load_trie_ptr(node_off, TRIE_RIGHT_OFF) };
-        if right != 0 {
-            if self.prune_trie(right)? {
-                unsafe { self.store_trie_ptr(node_off, TRIE_RIGHT_OFF, 0) };
-            } else {
-                is_leaf = false;
-            }
-        }
-
-        let prop = unsafe { self.load_trie_ptr(node_off, TRIE_PROP_OFF) };
-        if is_leaf && prop == 0 {
-            let namelen = unsafe { self.read_u32_data(node_off)? } as usize;
-            let node_abs = PROP_AREA_HEADER_SIZE as usize + node_off as usize;
-            let name_abs = node_abs + TRIE_HEADER_SIZE as usize;
-            unsafe {
-                if name_abs + namelen <= self.pa_size {
-                    core::ptr::write_bytes(self.as_mut_ptr().add(name_abs), 0, namelen);
-                }
-                if node_abs + TRIE_HEADER_SIZE as usize <= self.pa_size {
-                    core::ptr::write_bytes(self.as_mut_ptr().add(node_abs), 0, TRIE_HEADER_SIZE as usize);
-                }
-            }
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
     /// Remove a property from the trie.
     ///
     /// The node's `prop` pointer is zeroed (Release), the `prop_info` memory
     /// is wiped, and then a prune pass removes redundant leaf trie nodes.
     /// Returns `true` when the property was found and removed.
     pub fn remove(&mut self, name: &str) -> MmapResult<bool> {
-        self.remove_with_prune(name, true)
-    }
-
-    /// Remove a property from the trie with configurable prune behavior.
-    pub fn remove_with_prune(&mut self, name: &str, prune: bool) -> MmapResult<bool> {
         let node_off = match self.traverse_trie(name.as_bytes(), false)? {
             Some(o) => o,
             None => return Ok(false),
@@ -1071,10 +1017,6 @@ impl MmapPropArea {
             // Wipe the fixed header (PROP_INFO_SIZE bytes).
             let pi_abs = PROP_AREA_HEADER_SIZE as usize + prop_off as usize;
             core::ptr::write_bytes(self.as_mut_ptr().add(pi_abs), 0, PROP_INFO_SIZE as usize);
-        }
-
-        if prune {
-            let _ = self.prune_trie(0);
         }
 
         Ok(true)
