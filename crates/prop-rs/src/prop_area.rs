@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::offset_of;
+use std::ops::Add;
 
 use crate::prop_info::{
     align_up, PropertyInfo, RawLongProperty, RawPropAreaHeader, RawPropInfoHeader,
@@ -54,7 +55,7 @@ pub enum PropAreaError {
     InvalidMagic(u32),
     InvalidVersion(u32),
     InvalidBytesUsed(u32),
-    InvalidOffset(u32),
+    InvalidOffset(u32, String),
     InvalidKey(String),
     InPlaceUpdateTooLong {
         name: String,
@@ -79,7 +80,7 @@ impl fmt::Display for PropAreaError {
             Self::InvalidBytesUsed(bytes_used) => {
                 write!(f, "invalid bytes_used value: {bytes_used}")
             }
-            Self::InvalidOffset(offset) => write!(f, "invalid data offset: {offset}"),
+            Self::InvalidOffset(offset, detail) => write!(f, "invalid data offset: {offset} ({detail})"),
             Self::InvalidKey(key) => write!(f, "invalid property key: {key}"),
             Self::InPlaceUpdateTooLong {
                 name,
@@ -141,6 +142,7 @@ struct PropRecord {
     prop_offset: u32,
     value_offset: u32,
     is_long: bool,
+    serial: u32,
 }
 
 pub struct PropArea<M> {
@@ -151,9 +153,29 @@ pub struct PropArea<M> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PropAreaObjectKind {
-    TrieNode,
+    TrieNode {
+        left: u32,
+        right: u32,
+        children: u32,
+        prop: u32,
+        /// This prop trie node doesn't have child or prop
+        unused: bool,
+        /// This prop trie node has an offset field whose value smaller than its offset
+        abnormal_offset: bool,
+        /// This prop trie node doesn't have children, but its prop doesn't follow it
+        abnormal_prop: bool,
+    },
     DirtyBackup,
-    PropInfo,
+    PropInfo {
+        serial: u32,
+        long_value_offset: Option<u32>,
+        /// There are some bytes after the end of the value, is usually checked for ro props
+        /// or bootloader lock related props.
+        unclear_value: bool,
+        /// Its long value doesn't follow it
+        abnormal_long_value: bool,
+        abnormal_serial: bool,
+    },
     LongValue,
 }
 
@@ -166,6 +188,7 @@ pub struct PropAreaObjectInfo {
     pub end_offset:         u32,
     pub aligned_end_offset: u32,
     pub detail:             String,
+    pub abnormal:           bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +205,7 @@ pub struct PropAreaAllocationScan {
     pub has_dirty_backup: bool,
     pub objects:          Vec<PropAreaObjectInfo>,
     pub holes:            Vec<PropAreaHoleInfo>,
+    pub has_abnormal:     bool,
 }
 
 impl<M: Read + Seek> PropArea<M> {
@@ -248,6 +272,7 @@ impl<M: Read + Seek> PropArea<M> {
         let mut seen_nodes = BTreeSet::new();
         let mut seen_props = BTreeSet::new();
         let mut seen_longs = BTreeSet::new();
+        let mut has_abnormal = false;
 
         if has_dirty_backup {
             objects.push(Self::make_scan_object(
@@ -255,6 +280,7 @@ impl<M: Read + Seek> PropArea<M> {
                 PROP_TRIE_NODE_HEADER_SIZE,
                 DIRTY_BACKUP_SIZE,
                 "<dirty-backup>".to_owned(),
+                false,
             )?);
         }
 
@@ -265,6 +291,7 @@ impl<M: Read + Seek> PropArea<M> {
             &mut seen_props,
             &mut seen_longs,
             &mut objects,
+            &mut has_abnormal,
         )?;
 
         objects.sort_by(|a, b| {
@@ -308,6 +335,7 @@ impl<M: Read + Seek> PropArea<M> {
             has_dirty_backup,
             objects,
             holes,
+            has_abnormal,
         })
     }
 
@@ -451,6 +479,7 @@ impl<M: Read + Seek> PropArea<M> {
         let header = self.read_data(prop_offset, PROP_INFO_SIZE)?;
         let name = self.read_c_string(prop_offset + PROP_INFO_SIZE, None)?;
         let is_long = self.is_long_prop(&header);
+        let serial = read_u32_at(&header, offset_of!(RawPropInfoHeader, serial));
 
         let value_offset = if is_long {
             let long_offset = read_u32_at(&header,
@@ -463,9 +492,9 @@ impl<M: Read + Seek> PropArea<M> {
 
             prop_offset
                 .checked_add(long_offset)
-                .ok_or(PropAreaError::InvalidOffset(prop_offset))?
+                .ok_or(PropAreaError::InvalidOffset(prop_offset, format!("long offset of prop offset {prop_offset}")))?
         } else {
-            prop_offset + 4
+            prop_offset + offset_of!(RawPropInfoHeader, value) as u32
         };
 
         let value = if is_long {
@@ -485,6 +514,7 @@ impl<M: Read + Seek> PropArea<M> {
             prop_offset,
             value_offset,
             is_long,
+            serial,
         })
     }
 
@@ -536,6 +566,7 @@ impl<M: Read + Seek> PropArea<M> {
         seen_props: &mut BTreeSet<u32>,
         seen_longs: &mut BTreeSet<u32>,
         objects: &mut Vec<PropAreaObjectInfo>,
+        has_abnormal: &mut bool,
     ) -> Result<()> {
         if seen_nodes.contains(&offset) {
             return Ok(());
@@ -556,7 +587,7 @@ impl<M: Read + Seek> PropArea<M> {
             PROP_TRIE_NODE_HEADER_SIZE
                 .checked_add(node.namelen)
                 .and_then(|v| v.checked_add(1))
-                .ok_or(PropAreaError::InvalidOffset(node.offset))?
+                .ok_or(PropAreaError::InvalidOffset(node.offset, format!("trie at offset {offset} has invalid name size {}", node.namelen)))?
         };
 
         let trie_detail = if node.namelen == 0 {
@@ -565,11 +596,29 @@ impl<M: Read + Seek> PropArea<M> {
             node.name.clone()
         };
 
+        let unused = node.prop == 0 && node.children == 0 && offset != 0;
+        let abnormal_offset = (node.left != 0 && node.left <= offset) || 
+            (node.right != 0 && node.right <= offset) || 
+            (node.children != 0 && node.children <= offset) || 
+            (node.prop != 0 && node.prop <= offset);
+        let abnormal_prop = node.children == 0 && node.prop != 0 && (node.prop != offset + PROP_TRIE_NODE_HEADER_SIZE + align_up(node.namelen + 1, 4));
+        let abnormal = unused || abnormal_offset || abnormal_prop;
+        *has_abnormal |= abnormal;
+
         objects.push(Self::make_scan_object(
-            PropAreaObjectKind::TrieNode,
+            PropAreaObjectKind::TrieNode {
+                left: node.left,
+                right: node.right,
+                children: node.children,
+                prop: node.prop,
+                unused,
+                abnormal_offset,
+                abnormal_prop,
+            },
             node.offset,
             trie_size,
             trie_detail,
+            abnormal,
         )?);
 
         if node.prop != 0 && seen_props.insert(node.prop) {
@@ -580,13 +629,43 @@ impl<M: Read + Seek> PropArea<M> {
             let prop_size = PROP_INFO_SIZE
                 .checked_add(name_len)
                 .and_then(|v| v.checked_add(1))
-                .ok_or(PropAreaError::InvalidOffset(record.prop_offset))?;
+                .ok_or(PropAreaError::InvalidOffset(record.prop_offset, format!("prop at offset {} has invalid name len {name_len}", node.prop)))?;
+
+            
+            let value_len = record.value.len() as u32 + 1;
+            let value_max = if record.is_long {
+                align_up(value_len, 4)
+            } else {
+                PROP_VALUE_MAX as u32
+            };
+            let is_ro = record.name.starts_with("ro.");
+            let unclear_value = if is_ro && value_len < value_max as u32 {
+                let end = record.value_offset.add(value_len);
+                self.read_data(end, value_max - value_len)?
+                    .iter().any(|c| *c != 0)
+            } else {
+                false
+            };
+
+            let abnormal_long_value = record.is_long && record.value_offset != align_up(node.prop + PROP_INFO_SIZE + name_len + 1, 4);
+            let abnormal_serial = is_ro && ((record.serial & 0x00ff_ffff & !PROP_INFO_LONG_FLAG) >> 1) != 0;
+            let abnormal = unclear_value || abnormal_long_value || abnormal_serial;
+            *has_abnormal |= abnormal;
 
             objects.push(Self::make_scan_object(
-                PropAreaObjectKind::PropInfo,
+                PropAreaObjectKind::PropInfo {
+                    serial: record.serial,
+                    long_value_offset: if record.is_long { 
+                        Some(record.value_offset)
+                    } else { None },
+                    unclear_value,
+                    abnormal_long_value, 
+                    abnormal_serial,
+                },
                 record.prop_offset,
                 prop_size,
                 record.name.clone(),
+                abnormal,
             )?);
 
             if record.is_long && seen_longs.insert(record.value_offset) {
@@ -594,13 +673,14 @@ impl<M: Read + Seek> PropArea<M> {
                     .map_err(|_| PropAreaError::Corrupted("long value too long"))?;
                 let long_size = value_len
                     .checked_add(1)
-                    .ok_or(PropAreaError::InvalidOffset(record.value_offset))?;
+                    .ok_or(PropAreaError::InvalidOffset(record.value_offset, format!("long prop at {} has invalid value len {value_len}", node.prop)))?;
 
                 objects.push(Self::make_scan_object(
                     PropAreaObjectKind::LongValue,
                     record.value_offset,
                     long_size,
                     record.name,
+                    abnormal_long_value || unclear_value,
                 )?);
             }
         }
@@ -613,6 +693,7 @@ impl<M: Read + Seek> PropArea<M> {
                 seen_props,
                 seen_longs,
                 objects,
+                has_abnormal,
             )?;
         }
 
@@ -624,6 +705,7 @@ impl<M: Read + Seek> PropArea<M> {
                 seen_props,
                 seen_longs,
                 objects,
+                has_abnormal,
             )?;
         }
 
@@ -635,6 +717,7 @@ impl<M: Read + Seek> PropArea<M> {
                 seen_props,
                 seen_longs,
                 objects,
+                has_abnormal,
             )?;
         }
 
@@ -647,14 +730,15 @@ impl<M: Read + Seek> PropArea<M> {
         offset: u32,
         size: u32,
         detail: String,
+        abnormal: bool,
     ) -> Result<PropAreaObjectInfo> {
         let aligned_size = align_up(size, 4);
         let end_offset = offset
             .checked_add(size)
-            .ok_or(PropAreaError::InvalidOffset(offset))?;
+            .ok_or(PropAreaError::InvalidOffset(offset, format!("overflow end_offset at offset {offset} size {size}")))?;
         let aligned_end_offset = offset
             .checked_add(aligned_size)
-            .ok_or(PropAreaError::InvalidOffset(offset))?;
+            .ok_or(PropAreaError::InvalidOffset(offset, format!("overflow aligned_end_offset at offset {offset} size {size}")))?;
 
         Ok(PropAreaObjectInfo {
             kind,
@@ -664,6 +748,7 @@ impl<M: Read + Seek> PropArea<M> {
             end_offset,
             aligned_end_offset,
             detail,
+            abnormal,
         })
     }
 
@@ -716,7 +801,7 @@ impl<M: Read + Seek> PropArea<M> {
     fn read_c_string_bytes(&mut self, data_offset: u32, max_len: Option<u32>) -> Result<Vec<u8>> {
         let limit = max_len.unwrap_or(self.data_size.saturating_sub(data_offset));
         if data_offset > self.data_size {
-            return Err(PropAreaError::InvalidOffset(data_offset));
+            return Err(PropAreaError::InvalidOffset(data_offset, format!("read c string at {data_offset}")));
         }
 
         // Read in chunks sized to cover typical property names and values in
@@ -748,9 +833,9 @@ impl<M: Read + Seek> PropArea<M> {
     fn check_range(&self, data_offset: u32, len: u32) -> Result<u64> {
         let end = data_offset
             .checked_add(len)
-            .ok_or(PropAreaError::InvalidOffset(data_offset))?;
+            .ok_or(PropAreaError::InvalidOffset(data_offset, format!("check_range {data_offset} {len}")))?;
         if end > self.data_size {
-            return Err(PropAreaError::InvalidOffset(data_offset));
+            return Err(PropAreaError::InvalidOffset(data_offset, format!("check_range {data_offset} {len}")));
         }
         Ok(PROP_AREA_HEADER_SIZE + data_offset as u64)
     }
@@ -1030,7 +1115,7 @@ impl<M: Read + Write + Seek> PropArea<M> {
         );
         let current_offset = prop_offset
             .checked_add(current_rel)
-            .ok_or(PropAreaError::InvalidOffset(prop_offset))?;
+            .ok_or(PropAreaError::InvalidOffset(prop_offset, format!("get long value offset {prop_offset} {current_rel}")))?;
         let current_bytes = self.read_c_string_bytes(current_offset, None)?;
         let current_len = current_bytes.len();
         if value.len() > current_len {
@@ -1054,7 +1139,7 @@ impl<M: Read + Write + Seek> PropArea<M> {
         let long_value_offset = self.allocate_obj(long_value_size)?;
         let relative_offset = long_value_offset
             .checked_sub(prop_offset)
-            .ok_or(PropAreaError::InvalidOffset(long_value_offset))?;
+            .ok_or(PropAreaError::InvalidOffset(long_value_offset, format!("long_value_offset {long_value_offset} - prop_offset {prop_offset}")))?;
         let min_expected = align_up(PROP_INFO_SIZE + name_len + 1, 4);
         if relative_offset < min_expected {
             return Err(PropAreaError::Corrupted("invalid long value placement"));

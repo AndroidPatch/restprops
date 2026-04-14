@@ -225,11 +225,11 @@ fn scan_allocations_reports_objects_sorted_and_typed() {
     assert!(scan
         .objects
         .iter()
-        .any(|obj| obj.kind == PropAreaObjectKind::TrieNode));
+        .any(|obj| matches!(obj.kind, PropAreaObjectKind::TrieNode { .. })));
     assert!(scan
         .objects
         .iter()
-        .any(|obj| obj.kind == PropAreaObjectKind::PropInfo));
+        .any(|obj| matches!(obj.kind, PropAreaObjectKind::PropInfo { .. })));
     assert!(scan
         .objects
         .iter()

@@ -612,9 +612,9 @@ fn print_multi_area_error_summary(
 
 fn object_kind_name(kind: PropAreaObjectKind) -> &'static str {
     match kind {
-        PropAreaObjectKind::TrieNode => "trie-node",
+        PropAreaObjectKind::TrieNode { .. } => "trie-node",
         PropAreaObjectKind::DirtyBackup => "dirty-backup",
-        PropAreaObjectKind::PropInfo => "prop-info",
+        PropAreaObjectKind::PropInfo { .. } => "prop-info",
         PropAreaObjectKind::LongValue => "long-value",
     }
 }
@@ -623,19 +623,22 @@ fn print_allocation_scan(report: &PropAreaAllocationScan, show_objects: bool) {
     println!("bytes_used={}", report.bytes_used);
     println!("has_dirty_backup={}", report.has_dirty_backup);
 
-    if show_objects {
+    if show_objects || report.has_abnormal {
         println!("objects({}):", report.objects.len());
         for (index, object) in report.objects.iter().enumerate() {
-            println!(
-                "  [{index:03}] {:<10} off={} size={} aligned={} end={} aligned_end={} detail={}",
-                object_kind_name(object.kind),
-                object.offset,
-                object.size,
-                object.aligned_size,
-                object.end_offset,
-                object.aligned_end_offset,
-                object.detail
-            );
+            if show_objects || object.abnormal {
+                println!(
+                    "  [{index:03}] {:<10} off={} size={} aligned={} end={} aligned_end={} detail={} {:?}",
+                    object_kind_name(object.kind),
+                    object.offset,
+                    object.size,
+                    object.aligned_size,
+                    object.end_offset,
+                    object.aligned_end_offset,
+                    object.detail,
+                    object.kind
+                );
+            }
         }
     }
 
@@ -679,6 +682,7 @@ fn cmd_scan(
     let mut skipped_missing = 0usize;
     let mut other_errors = Vec::new();
     let mut printed_any = false;
+    let mut abnormal_areas = 0;
 
     for (ctx_label, path) in &targets {
         let mut area = match open_area_ro_detailed(path) {
@@ -708,6 +712,16 @@ fn cmd_scan(
             }
         };
 
+        let abnormal = report.has_abnormal || !report.holes.is_empty();
+
+        if !show_objects && !abnormal {
+            continue;
+        }
+
+        if abnormal {
+            abnormal_areas += 1;
+        }
+
         if printed_any {
             println!();
         }
@@ -716,6 +730,8 @@ fn cmd_scan(
         println!("# context: {ctx_label}  |  file: {}", path.display());
         print_allocation_scan(&report, show_objects);
     }
+
+    println!("Total abnormal areas: {abnormal_areas}");
 
     if !specific_context {
         print_multi_area_error_summary(
@@ -1160,7 +1176,7 @@ fn run() -> AppResult<()> {
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("error: {e}");
+        eprintln!("error: {e:?}");
         process::exit(1);
     }
 }
