@@ -36,7 +36,6 @@
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::fmt;
-use std::ops::Add;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
 
 use memmap2::MmapMut;
@@ -152,6 +151,7 @@ struct ReadPropResult {
     serial_counter: u32,
 }
 
+#[derive(Debug)]
 struct PropTrieInfo {
     left: u32,
     right: u32,
@@ -204,29 +204,24 @@ impl MmapPropArea {
     pub fn new_anon_from(r: &Self) -> MmapResult<Self> {
         let mut new_map = MmapMut::map_anon(r.pa_size).map_err(|_| MmapPropAreaError::MapAreaFailed)?;
 
+        let has_dirty = r.has_dirty_backup()?;
+
         unsafe {
             (new_map.as_mut_ptr().add(8) as *mut u32).write(PROP_AREA_MAGIC);
             (new_map.as_mut_ptr().add(12) as *mut u32).write(PROP_AREA_VERSION);
-            (new_map.as_mut_ptr().add(PA_BYTES_USED_OFF) as *mut u32).write(if r.has_dirty_backup()? { TRIE_SIZE + PROP_VALUE_MAX as u32 } else { TRIE_SIZE })
+            (new_map.as_mut_ptr().add(PA_BYTES_USED_OFF) as *mut u32).write(if has_dirty { TRIE_SIZE + PROP_VALUE_MAX as u32 } else { TRIE_SIZE })
         }
 
         Self::new(new_map)
     }
 
     fn read_prop_trie(&self, offset: u32) -> MmapResult<PropTrieInfo> {
-        let abs = PROP_AREA_HEADER_SIZE as u32 + offset;
-        let max_off = self.read_bytes_used().add(PROP_AREA_HEADER_SIZE as u32).min(self.pa_size as u32);
-
-        if abs > max_off || abs + TRIE_SIZE > max_off {
-            return Err(MmapPropAreaError::InvalidOffset(abs));
-        }
-
         unsafe {
             Ok(PropTrieInfo { 
-                left: self.read_u32_data(abs + TRIE_LEFT_OFF)?, 
-                right: self.read_u32_data(abs + TRIE_RIGHT_OFF)?, 
-                children: self.read_u32_data(abs + TRIE_CHILDREN_OFF)?, 
-                prop: self.read_u32_data(abs + TRIE_PROP_OFF)?, 
+                left: self.read_u32_data(offset + TRIE_LEFT_OFF)?, 
+                right: self.read_u32_data(offset + TRIE_RIGHT_OFF)?, 
+                children: self.read_u32_data(offset + TRIE_CHILDREN_OFF)?, 
+                prop: self.read_u32_data(offset + TRIE_PROP_OFF)?, 
             })
         }
     }
@@ -249,7 +244,7 @@ impl MmapPropArea {
     pub fn fill_prop_from(&mut self, another: &Self) -> MmapResult<()> {
         let mut props = BTreeMap::<u32, ReadPropResult>::new();
 
-        self.for_each_property_info_offset(0, |off| -> MmapResult<()> {
+        another.for_each_property_info_offset(0, |off| -> MmapResult<()> {
             props.insert(off, another.read_prop_info(off)?);
             Ok(())
         })?;
