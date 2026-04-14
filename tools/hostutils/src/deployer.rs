@@ -36,7 +36,8 @@ struct Args {
     #[arg(long)]
     serial: Option<String>,
 
-    #[arg(long, default_value = "/data/local/tmp/sysprop")]
+    /// The directory to deploy on the device
+    #[arg(long, default_value = "/data/local/tmp")]
     remote: String,
 
     #[arg(long, default_value = "adb")]
@@ -44,6 +45,9 @@ struct Args {
 
     #[arg(long, default_value = "cargo")]
     cargo: String,
+
+    /// The binary to deploy
+    name: String,
 }
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -106,7 +110,7 @@ fn run() -> Result<()> {
         .arg(&ndk_abi)
         .arg("build")
         .arg("--bin")
-        .arg("sysprop")
+        .arg(&args.name)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -120,17 +124,19 @@ fn run() -> Result<()> {
     let local_bin = PathBuf::from("target")
         .join(&rust_target)
         .join(args.profile.as_dir())
-        .join("sysprop");
+        .join(&args.name);
 
     if !local_bin.exists() {
         return Err(format!("built binary not found: {}", local_bin.display()).into());
     }
 
+    let remote_path= format!("{}/{}", args.remote, args.name);
+
     let mut adb_push = adb_base(&args);
     adb_push
         .arg("push")
         .arg(&local_bin)
-        .arg(&args.remote)
+        .arg(&remote_path)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -141,17 +147,17 @@ fn run() -> Result<()> {
         .arg("shell")
         .arg("chmod")
         .arg("+x")
-        .arg(&args.remote)
+        .arg(&remote_path)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     run_checked(&mut adb_chmod, "adb shell chmod")?;
 
-    println!("done: {} -> {}", local_bin.display(), args.remote);
+    println!("done: {} -> {}", local_bin.display(), remote_path);
     if let Some(serial) = &args.serial {
-        println!("run: adb -s {serial} shell {} --help", args.remote);
+        println!("run: adb -s {serial} shell {} --help", remote_path);
     } else {
-        println!("run: adb shell {} --help", args.remote);
+        println!("run: adb shell {} --help", remote_path);
     }
 
     Ok(())
