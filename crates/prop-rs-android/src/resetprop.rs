@@ -182,4 +182,8 @@ impl ResetProp {
     pub fn rebuild(&self, area: &String) -> SysPropResult<()> {
         sys_prop::rebuild(area)
     }
+
+    pub fn rebuild_all(&self, force: bool) -> SysPropResult<()> {
+        sys_prop::rebuild_all(force)
+    }
 }

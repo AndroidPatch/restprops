@@ -36,12 +36,15 @@
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::fmt;
+use std::io::Cursor;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
 
 use memmap2::MmapMut;
 use prop_rs::{
-    AREA_SERIAL_OFFSET, PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC, PROP_AREA_VERSION, PROP_VALUE_MAX,
+    AREA_SERIAL_OFFSET, PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC, PROP_AREA_VERSION, PROP_VALUE_MAX, PropArea,
 };
+
+use crate::mmap_prop_area::MmapPropAreaError::MapAreaFailed;
 
 // ── Layout constants (all derived from prop-rs / bionic structs) ─────────────
 
@@ -169,7 +172,7 @@ struct PropTrieInfo {
 /// All pointer arithmetic and atomic operations are confined to the `unsafe`
 /// blocks inside this struct's methods.
 pub struct MmapPropArea {
-    map: MmapMut,
+    pub(crate) map: MmapMut,
     /// Total size of the mapping in bytes.
     pa_size: usize,
     /// `pa_data_size = pa_size - PROP_AREA_HEADER_SIZE`.
@@ -199,6 +202,11 @@ impl MmapPropArea {
         }
 
         Ok(Self { map, pa_size, data_size })
+    }
+
+    pub(crate) fn as_prop_area(&mut self) -> MmapResult<PropArea<Cursor<&mut MmapMut>>> {
+        let cursor = Cursor::new(&mut self.map);
+        PropArea::new(cursor).map_err(|_| MapAreaFailed)
     }
 
     pub fn new_anon_from(r: &Self) -> MmapResult<Self> {

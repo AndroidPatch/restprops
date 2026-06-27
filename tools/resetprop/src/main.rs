@@ -169,10 +169,11 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
     }
 
     if cli.rebuild {
-        let name = cli
-            .name
-            .context("--delete requires a property area context name")?;
-        rp.rebuild(&name)?;
+        if let Some(name) = cli.name {
+            rp.rebuild(&name)?;
+        } else {
+            rp.rebuild_all(false)?;
+        }
         return Ok(());
     }
 
