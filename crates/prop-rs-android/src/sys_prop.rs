@@ -735,6 +735,15 @@ pub fn rebuild(context: &String) -> SysPropResult<()> {
         Ok(())
     })?;
 
+    if let Some(appcompat_ctx) = appcompat_ctx() {
+        appcompat_ctx.with_area_rw(context, |area| {
+            let mut anon_area = MmapPropArea::new_anon_from(area)?;
+            anon_area.fill_prop_from(area)?;
+            area.replace_with_area(&anon_area)?;
+            Ok(())
+        })?;
+    }
+    
     Ok(())
 }
 
