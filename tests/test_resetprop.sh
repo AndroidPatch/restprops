@@ -644,14 +644,14 @@ section "9. 等待模式 (-w)"
 
 # 9.1 等待已存在的属性（应立即返回）
 rp_set -n "${TEST_PREFIX}.wait" "exists"
-assert_success "9.1 等待已存在的属性立即成功" $RESETPROP -w "${TEST_PREFIX}.wait" --timeout 2
+assert_success "9.1 等待已存在的属性立即成功" $RESETPROP -w --timeout 2 "${TEST_PREFIX}.wait"
 
 # 9.2 等待超时（属性不存在）
-assert_exit "9.2 等待不存在的属性超时" 2 $RESETPROP -w "${TEST_PREFIX}.will_never_exist" --timeout 1
+assert_exit "9.2 等待不存在的属性超时" 2 $RESETPROP -w --timeout 1 "${TEST_PREFIX}.will_never_exist"
 
 # 9.3 等待属性值变化（当前值不同，应立即返回）
 rp_set -n "${TEST_PREFIX}.wait_change" "new_value"
-assert_success "9.3 等待属性值变化（值已不同）立即成功" $RESETPROP -w "${TEST_PREFIX}.wait_change" "old_value" --timeout 2
+assert_success "9.3 等待属性值变化（值已不同）立即成功" $RESETPROP -w --timeout 2 "${TEST_PREFIX}.wait_change" "old_value"
 
 # 9.4 异步等待 + 后台设置（等待属性出现）
 $RESETPROP -d "${TEST_PREFIX}.wait" >/dev/null 2>&1
@@ -660,7 +660,7 @@ $RESETPROP -d "${TEST_PREFIX}.wait" >/dev/null 2>&1
     rp_set -n "${TEST_PREFIX}.wait" "async_set"
 ) &
 bg_pid=$!
-$RESETPROP -w "${TEST_PREFIX}.wait" --timeout 5 >/dev/null 2>&1
+$RESETPROP -w --timeout 5 "${TEST_PREFIX}.wait" >/dev/null 2>&1
 rc=$?
 wait $bg_pid 2>/dev/null
 if [ $rc -eq 0 ]; then
@@ -677,7 +677,7 @@ rp_set -n "${TEST_PREFIX}.wait_change" "old_serial"
     rp_set -n "${TEST_PREFIX}.wait_change" "new_serial"
 ) &
 bg_pid=$!
-$RESETPROP -w "${TEST_PREFIX}.wait_change" "old_serial" --timeout 5 >/dev/null 2>&1
+$RESETPROP -w --timeout 5 "${TEST_PREFIX}.wait_change" "old_serial" >/dev/null 2>&1
 rc=$?
 wait $bg_pid 2>/dev/null
 if [ $rc -eq 0 ]; then
