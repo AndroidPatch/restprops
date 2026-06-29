@@ -65,13 +65,17 @@ struct Args {
     #[arg(short = 'f', long = "file")]
     file: Option<String>,
 
-    /// Show SELinux context when listing properties.
+    /// Show SELinux context when listing properties, or rebuild the property area of the property NAME if -c is used.
     #[arg(short = 'Z')]
     show_context: bool,
 
     /// Rebuild property area.
-    #[arg(short = 'c')]
+    #[arg(short = 'c', long = "rebuild")]
     rebuild: bool,
+
+    /// Force rebuild all property area, should be used together with `-c`
+    #[arg(long = "force")]
+    force: bool,
 
     /// Property name.
     name: Option<String>,
@@ -121,10 +125,13 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
     // Validate: wait / file are exclusive
     let special_modes = u8::from(cli.wait)
         + u8::from(cli.file.is_some())
-        + u8::from(cli.delete)
-        + u8::from(cli.rebuild); // TODO: support rebuild after any write command
+        + u8::from(cli.delete);
     if special_modes > 1 {
         bail!("multiple operation modes detected");
+    }
+
+    if cli.rebuild && !(special_modes == 0 || cli.delete) {
+        bail!("-c can only be used together with -d");
     }
 
     // -w: wait mode
@@ -165,14 +172,24 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
         if !deleted {
             bail!("{name} not found");
         }
-        return Ok(());
+        if !cli.rebuild {
+            return Ok(());
+        }
     }
 
     if cli.rebuild {
         if let Some(name) = cli.name {
-            rp.rebuild(&name)?;
+            let ctx = if cli.show_context || cli.delete {
+                sys_prop::get_context(&name)?
+            } else {
+                name
+            };
+            rp.rebuild(&ctx)?;
         } else {
-            rp.rebuild_all(false)?;
+            if !rp.rebuild_all(cli.force)? {
+                eprintln!("Something wrong happened, see log for detail.");
+                std::process::exit(1);
+            }
         }
         return Ok(());
     }

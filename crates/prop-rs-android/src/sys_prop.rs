@@ -14,7 +14,7 @@
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::{self, Read, Seek};
+use std::io::{self};
 use std::io::Cursor;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -726,59 +726,41 @@ pub fn wait(
     }
 }
 
-fn rebuild_area(area: &mut MmapPropArea) -> SysPropResult<()> {
-    let mut anon_area = MmapPropArea::new_anon_from(area)?;
-    anon_area.fill_prop_from(area)?;
-    area.replace_with_area(&anon_area)?;
-    Ok(())
-}
-
-pub fn rebuild(context: &String) -> SysPropResult<()> {
-    let ctx = prop_ctx()?;
-    ctx.with_area_rw(context, rebuild_area)?;
-
-    if let Some(appcompat_ctx) = appcompat_ctx() {
-        appcompat_ctx.with_area_rw(context, rebuild_area)?;
-    }
-    
-    Ok(())
-}
-
-fn need_rebuild<M: Read + Seek>(area: &mut PropArea<M>) -> SysPropResult<bool> {
-    let res = area.scan_allocations()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-    Ok(res.has_abnormal)
-}
-
-fn rebuild_all_ctx(ctx: &CachedPropertyContext, force: bool) -> SysPropResult<()> {
-    for name in ctx.ctx.list_all_contexts() {
-        ctx.with_area_rw(name, |area| {
-            let can_rebuild = if force {
-                true
-            } else {
-                let mut prop_area = area.as_prop_area().map_err(|e| SysPropError::MmapPropArea(e))?;
-                need_rebuild(&mut prop_area)?
-            };
-            if can_rebuild {
-                rebuild_area(area)?;
+pub fn rebuild(context: &String, check: bool, appcompat: bool) -> SysPropResult<()> {
+    let mut callback = |area: &mut MmapPropArea| {
+        if check {
+            let mut prop_area = area.as_prop_area()?;
+            let res = prop_area.scan_allocations()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            if !res.has_abnormal {
+                return Ok(())
             }
-            Ok(())
-        })?;
-    }
+        }
+        let mut anon_area = MmapPropArea::new_anon_from(area)?;
+        anon_area.fill_prop_from(area)?;
+        area.replace_with_area(&anon_area)?;
+        Ok(())
+    };
 
-    Ok(())
-}
-
-pub fn rebuild_all(force: bool) -> SysPropResult<()> {
-    let ctx = prop_ctx()?;
-    rebuild_all_ctx(ctx, force)?;
-
-    if let Some(appcompat_ctx) = appcompat_ctx() {
-        rebuild_all_ctx(appcompat_ctx, force)?;
+    if !appcompat {
+        let ctx = prop_ctx()?;
+        ctx.with_area_rw(context, &mut callback)?;
+    } else if let Some(appcompat_ctx) = appcompat_ctx() {
+        appcompat_ctx.with_area_rw(context, &mut callback)?;
     }
     
     Ok(())
+}
+
+pub fn list_contexts(appcompat: bool) -> SysPropResult<Vec<&'static str>> {
+    let ctx = if !appcompat { prop_ctx()? } else { 
+        if let Some(ctx) = appcompat_ctx() {
+            ctx
+        } else {
+            return Ok(Vec::<_>::new())
+        }
+    };
+    Ok(ctx.ctx.list_all_contexts())
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────────

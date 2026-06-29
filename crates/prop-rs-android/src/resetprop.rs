@@ -180,10 +180,29 @@ impl ResetProp {
     }
 
     pub fn rebuild(&self, area: &String) -> SysPropResult<()> {
-        sys_prop::rebuild(area)
+        sys_prop::rebuild(area, false, false)?;
+        sys_prop::rebuild(area, false, true)?;
+        Ok(())
     }
 
-    pub fn rebuild_all(&self, force: bool) -> SysPropResult<()> {
-        sys_prop::rebuild_all(force)
+    pub fn rebuild_all(&self, force: bool) -> SysPropResult<bool> {
+        let contexts = sys_prop::list_contexts(false)?;
+        let mut all_success = true;
+        for name in contexts {
+            if let Err(e) = sys_prop::rebuild(&name.to_string(), !force, false) {
+                log::error!("failed to rebuild area {name}: {e:?}");
+                all_success = false;
+            }
+        }
+
+        let contexts = sys_prop::list_contexts(true)?;
+        for name in contexts {
+            if let Err(e) = sys_prop::rebuild(&name.to_string(), !force, true) {
+                log::error!("failed to rebuild appcompat area {name}: {e:?}");
+                all_success = false;
+            }
+        }
+
+        Ok(all_success)
     }
 }
