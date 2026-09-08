@@ -77,6 +77,7 @@ pub const PROP_INFO_LONG_FLAG: u32 = 1 << 16;
 
 /// Mask for the counter part of `serial` (low 24 bits).
 const SERIAL_COUNTER_MASK: u32 = 0x00ff_ffff;
+const SERIAL_COUNTER_WITHOUT_LONG_FLAG_MASK: u32 = SERIAL_COUNTER_MASK & !PROP_INFO_LONG_FLAG;
 
 /// Mask for the length/flags part of `serial` (high 8 bits).
 const SERIAL_LEN_MASK: u32 = 0xff00_0000;
@@ -902,8 +903,9 @@ impl MmapPropArea {
     ) -> MmapResult<()> {
         let value_b = value.as_bytes();
         let old_serial = unsafe { self.read_pi_serial_relaxed(data_off) };
+        let old_is_long = (old_serial & PROP_INFO_LONG_FLAG) != 0;
         let is_long = value_b.len() >= PROP_VALUE_MAX;
-        *need_rebuild = is_long || (old_serial & PROP_INFO_LONG_FLAG) != 0;
+        *need_rebuild = old_is_long || is_long;
 
         // ── Validate before touching serial ─────────────────────────────────
         let long_value_data_off = if is_long {
@@ -1067,6 +1069,115 @@ impl MmapPropArea {
 /// Compose the initial serial for a newly created `prop_info`.
 ///
 /// Matches bionic `prop_info` constructor: `valuelen << 24` (Relaxed).
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod tests {
+    use super::*;
+
+    fn new_test_area(size: usize) -> MmapPropArea {
+        let mut map = MmapMut::map_anon(size).unwrap();
+        {
+            let cursor = Cursor::new(&mut map[..]);
+            PropArea::create(cursor, size as u64).unwrap();
+        }
+        MmapPropArea::new(map).unwrap()
+    }
+
+    fn upsert(area: &mut MmapPropArea, serial_area: &mut MmapPropArea, name: &str, value: &str) -> bool {
+        let mut need_rebuild = false;
+        area.upsert(name, value, serial_area, &mut need_rebuild).unwrap();
+        need_rebuild
+    }
+
+    fn prop_offset(area: &mut MmapPropArea, name: &str) -> u32 {
+        area.find(name).unwrap().unwrap()
+    }
+
+    fn read_value(area: &mut MmapPropArea, name: &str) -> String {
+        let data_off = prop_offset(area, name);
+        let prop = area.read_prop_info(data_off).unwrap();
+        String::from_utf8(prop.value).unwrap()
+    }
+
+    fn long_relative_offset(area: &mut MmapPropArea, name: &str) -> u32 {
+        let data_off = prop_offset(area, name);
+        unsafe { area.read_u32_data(data_off + PROP_INFO_LONG_OFFSET_OFF).unwrap() }
+    }
+
+    fn read_long_value_at(area: &MmapPropArea, prop_off: u32, relative_off: u32) -> String {
+        let bytes = unsafe { area.read_zero_end_data(prop_off + relative_off).unwrap() };
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn ro_inline_to_long_allocates_long_value_and_requests_rebuild() {
+        let key = "ro.test.inline_to_long";
+        let mut area = new_test_area(8192);
+        let mut serial_area = new_test_area(4096);
+
+        assert!(!upsert(&mut area, &mut serial_area, key, "short"));
+        let before_prop_off = prop_offset(&mut area, key);
+
+        let new_value = "x".repeat(PROP_VALUE_MAX);
+        assert!(upsert(&mut area, &mut serial_area, key, &new_value));
+
+        let after_prop_off = prop_offset(&mut area, key);
+        let slot = area.inspect_value_slot(key).unwrap().unwrap();
+        let serial = area.read_serial(after_prop_off);
+
+        assert_eq!(after_prop_off, before_prop_off);
+        assert!(slot.is_long);
+        assert_eq!(slot.value_len, new_value.len());
+        assert_ne!(serial & PROP_INFO_LONG_FLAG, 0);
+        assert_eq!(read_value(&mut area, key), new_value);
+    }
+
+    #[test]
+    fn ro_long_to_long_always_allocates_new_long_value_and_requests_rebuild() {
+        let key = "ro.test.long_to_long";
+        let mut area = new_test_area(8192);
+        let mut serial_area = new_test_area(4096);
+
+        let old_value = "a".repeat(PROP_VALUE_MAX);
+        let new_value = "b".repeat(PROP_VALUE_MAX);
+
+        assert!(!upsert(&mut area, &mut serial_area, key, &old_value));
+        let prop_off = prop_offset(&mut area, key);
+        let old_relative_off = long_relative_offset(&mut area, key);
+
+        assert!(upsert(&mut area, &mut serial_area, key, &new_value));
+        let new_relative_off = long_relative_offset(&mut area, key);
+        let serial = area.read_serial(prop_off);
+
+        assert_ne!(new_relative_off, old_relative_off);
+        assert_ne!(serial & PROP_INFO_LONG_FLAG, 0);
+        assert_eq!(read_value(&mut area, key), new_value);
+        assert_eq!(read_long_value_at(&area, prop_off, old_relative_off), old_value);
+    }
+
+    #[test]
+    fn ro_long_to_inline_clears_long_flag_and_requests_rebuild() {
+        let key = "ro.test.long_to_inline";
+        let mut area = new_test_area(8192);
+        let mut serial_area = new_test_area(4096);
+
+        let old_value = "a".repeat(PROP_VALUE_MAX);
+        assert!(!upsert(&mut area, &mut serial_area, key, &old_value));
+        let prop_off = prop_offset(&mut area, key);
+        let old_relative_off = long_relative_offset(&mut area, key);
+
+        assert!(upsert(&mut area, &mut serial_area, key, "short"));
+
+        let slot = area.inspect_value_slot(key).unwrap().unwrap();
+        let serial = area.read_serial(prop_off);
+
+        assert!(!slot.is_long);
+        assert_eq!(slot.value_len, "short".len());
+        assert_eq!(read_value(&mut area, key), "short");
+        assert_eq!(serial & PROP_INFO_LONG_FLAG, 0);
+        assert_eq!(read_long_value_at(&area, prop_off, old_relative_off), old_value);
+    }
+}
+
 pub fn compose_initial_serial(serial_len: u32, is_long: bool) -> u32 {
     let mut s = (serial_len << 24) & SERIAL_LEN_MASK;
     if is_long {
@@ -1084,7 +1195,7 @@ pub fn compose_visible_serial(serial_dirty: u32, serial_len: u32, is_long: bool)
     if is_long {
         s |= PROP_INFO_LONG_FLAG;
     }
-    s | (serial_dirty.wrapping_add(1) & SERIAL_COUNTER_MASK)
+    s | (serial_dirty.wrapping_add(1) & SERIAL_COUNTER_WITHOUT_LONG_FLAG_MASK)
 }
 
 /// Compose the final "hidden" serial written at the end of `Update()` to
@@ -1097,7 +1208,7 @@ pub fn compose_hidden_serial(serial_dirty: u32, serial_len: u32, is_long: bool) 
     if is_long {
         s |= PROP_INFO_LONG_FLAG;
     }
-    s | ((serial_dirty & !1u32) & SERIAL_COUNTER_MASK)
+    s | ((serial_dirty & !1u32) & SERIAL_COUNTER_WITHOUT_LONG_FLAG_MASK)
 }
 
 // ── Low-level atomic / futex utilities ───────────────────────────────────────
