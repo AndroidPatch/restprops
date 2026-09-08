@@ -157,8 +157,10 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
     if let Some(path) = &cli.file {
         let file = File::open(path).with_context(|| format!("Failed to open {path}"))?;
         let reader = BufReader::new(file);
-        rp.load_props(reader.lines())
-            .context("Failed to load properties from file")?;
+        if rp.load_props(reader.lines())
+            .context("Failed to load properties from file")? {
+            eprintln!("resetprop: warning: rebuild is needed!");
+        }
         return Ok(());
     }
 
@@ -197,8 +199,10 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
     match (&cli.name, &cli.value) {
         // resetprop name value (set)
         (Some(name), Some(value)) => {
-            rp.set(name, value)
-                .with_context(|| format!("Failed to set {name}"))?;
+            if rp.set(name, value)
+                .with_context(|| format!("Failed to set {name}"))? {
+                eprintln!("resetprop: warning: rebuild is needed!");
+            }
         }
 
         // resetprop name (get)

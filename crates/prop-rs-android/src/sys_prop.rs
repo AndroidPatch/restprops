@@ -572,8 +572,10 @@ pub fn for_each(mut callback: impl FnMut(&str, &str)) {
 ///   ordering (see `system_properties.cpp` Update/Add).
 /// - For other properties: uses `__system_property_set` which goes through
 ///   init's `property_service` socket.
-pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
+pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<bool> {
     let force_skip = skip_svc || key.starts_with("ro.");
+    let mut need_rebuild = false;
+    let mut need_rebuild_appcompat = false;
 
     if !key.starts_with("ro.") && value.len() >= PROP_VALUE_MAX {
         return Err(SysPropError::ValueTooLong {
@@ -588,7 +590,7 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
         let ctx = prop_ctx()?;
         let context = ctx.get_context_for_name(key);
         ctx.with_area_and_serial_rw(context, |area, serial_area| {
-            area.upsert(key, value, serial_area)?;
+            area.upsert(key, value, serial_area, &mut need_rebuild)?;
             Ok(())
         })?;
 
@@ -597,7 +599,7 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
             let override_key = strip_appcompat_prefix(key);
             let ctx_name = appcompat.get_context_for_name(override_key);
             let _ = appcompat.with_area_and_serial_rw(ctx_name, |ov_area, serial_area| {
-                ov_area.upsert(override_key, value, serial_area)?;
+                ov_area.upsert(override_key, value, serial_area, &mut need_rebuild_appcompat)?;
                 Ok(())
             });
         }
@@ -611,7 +613,7 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
         }
     }
 
-    Ok(())
+    Ok(need_rebuild || need_rebuild_appcompat)
 }
 
 /// Delete a property from shared memory.

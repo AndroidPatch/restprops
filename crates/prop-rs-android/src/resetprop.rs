@@ -62,8 +62,8 @@ impl ResetProp {
     /// This matches Magisk's behavior: property_service already persists
     /// `persist.*` keys by itself, so we only need to manually persist when
     /// we bypass it.
-    pub fn set(&self, name: &str, value: &str) -> SysPropResult<()> {
-        sys_prop::set(name, value, self.skip_svc)?;
+    pub fn set(&self, name: &str, value: &str) -> SysPropResult<bool> {
+        let need_rebuild = sys_prop::set(name, value, self.skip_svc)?;
 
         let skip = self.skip_svc || name.starts_with("ro.");
         if skip && self.persistent && name.starts_with("persist.") {
@@ -73,7 +73,7 @@ impl ResetProp {
         if self.verbose {
             eprintln!("resetprop: set {name}={value}");
         }
-        Ok(())
+        Ok(need_rebuild)
     }
 
     /// Delete a property.
@@ -154,7 +154,8 @@ impl ResetProp {
     pub fn load_props(
         &self,
         lines: impl Iterator<Item = Result<String, io::Error>>,
-    ) -> SysPropResult<()> {
+    ) -> SysPropResult<bool> {
+        let mut need_rebuild = false;
         for line in lines {
             let line = line.map_err(|e| {
                 sys_prop::SysPropError::InvalidCString(format!("io error: {e}"))
@@ -174,9 +175,9 @@ impl ResetProp {
                 continue;
             }
 
-            self.set(key, value)?;
+            need_rebuild |= self.set(key, value)?;
         }
-        Ok(())
+        Ok(need_rebuild)
     }
 
     pub fn rebuild(&self, area: &String) -> SysPropResult<()> {

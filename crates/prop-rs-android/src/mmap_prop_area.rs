@@ -859,6 +859,7 @@ impl MmapPropArea {
         name: &str,
         value: &str,
         serial_pa: &mut MmapPropArea,
+        need_rebuild: &mut bool,
     ) -> MmapResult<()> {
         let name_b = name.as_bytes();
         let value_b = value.as_bytes();
@@ -871,7 +872,7 @@ impl MmapPropArea {
         // Property already exists — delegate to update.
         let existing_off = unsafe { self.load_trie_ptr(node_off, TRIE_PROP_OFF) };
         if existing_off != 0 {
-            return self.update(existing_off, value, serial_pa);
+            return self.update(existing_off, value, serial_pa, need_rebuild);
         }
 
         let is_long = value_b.len() >= PROP_VALUE_MAX;
@@ -897,29 +898,18 @@ impl MmapPropArea {
         data_off: u32,
         value: &str,
         serial_pa: &mut MmapPropArea,
+        need_rebuild: &mut bool,
     ) -> MmapResult<()> {
         let value_b = value.as_bytes();
         let old_serial = unsafe { self.read_pi_serial_relaxed(data_off) };
-        let is_long = (old_serial & PROP_INFO_LONG_FLAG) != 0;
+        let is_long = value_b.len() >= PROP_VALUE_MAX;
+        *need_rebuild = is_long || (old_serial & PROP_INFO_LONG_FLAG) != 0;
 
         // ── Validate before touching serial ─────────────────────────────────
-        let (lv_data_off, max_long_len) = if is_long {
-            let loff = unsafe { self.read_u32_data(data_off + PROP_INFO_LONG_OFFSET_OFF)? };
-            let lv_data_off = data_off + loff;
-            let lv_abs = PROP_AREA_HEADER_SIZE as usize + lv_data_off as usize;
-            let old_long_len = unsafe {
-                libc::strlen(self.as_ptr().add(lv_abs) as *const libc::c_char)
-            };
-            let max_long_len = ((old_long_len + 1 + 3) & !3).saturating_sub(1);
-            if value_b.len() > max_long_len {
-                return Err(MmapPropAreaError::ValueTooLong { len: value_b.len() });
-            }
-            (lv_data_off, max_long_len)
+        let long_value_data_off = if is_long {
+            self.allocate(value.len() + 1)?
         } else {
-            if value_b.len() >= PROP_VALUE_MAX {
-                return Err(MmapPropAreaError::ValueTooLong { len: value_b.len() });
-            }
-            (0, 0)
+            0
         };
 
         // ── Set dirty bit ────────────────────────────────────────────────────
@@ -929,16 +919,22 @@ impl MmapPropArea {
         // ── Write new value ──────────────────────────────────────────────────
         if is_long {
             unsafe {
-                self.write_bytes_data(lv_data_off, value_b);
+                // `long_property.offset` is relative from `prop_info` start.
+                let long_rel_off = long_value_data_off - data_off;
+                self.write_bytes_data(long_value_data_off, value_b);
                 *self.as_mut_ptr()
-                    .add(PROP_AREA_HEADER_SIZE as usize + lv_data_off as usize + value_b.len()) = 0;
-                if value_b.len() < max_long_len {
-                    let tail_abs = PROP_AREA_HEADER_SIZE as usize
-                        + lv_data_off as usize
-                        + value_b.len() + 1;
-                    let tail_len = max_long_len - (value_b.len() + 1);
-                    core::ptr::write_bytes(self.as_mut_ptr().add(tail_abs), 0, tail_len);
-                }
+                    .add(PROP_AREA_HEADER_SIZE as usize + long_value_data_off as usize + value_b.len()) = 0;
+
+                // Write error message into value union.
+                let err_abs = data_off + PROP_INFO_LONG_ERR_OFF;
+                let err_bytes = LONG_LEGACY_ERROR.len().min(LONG_LEGACY_ERROR_BUFFER_SIZE - 1);
+                self.write_bytes_data(err_abs, &LONG_LEGACY_ERROR[..err_bytes]);
+                *self.as_mut_ptr()
+                    .add(PROP_AREA_HEADER_SIZE as usize + err_abs as usize + err_bytes) = 0;
+
+                // Write long_property.offset.
+                let loff_abs = data_off + PROP_INFO_LONG_OFFSET_OFF;
+                self.write_u32_data(loff_abs, long_rel_off);
             }
         } else {
             let val_abs = data_off + PROP_INFO_VALUE_OFF;
@@ -1056,11 +1052,12 @@ impl MmapPropArea {
         name: &str,
         value: &str,
         serial_pa: &mut MmapPropArea,
+        need_rebuild: &mut bool,
     ) -> MmapResult<()> {
         if let Some(data_off) = self.find(name)? {
-            self.update(data_off, value, serial_pa)
+            self.update(data_off, value, serial_pa, need_rebuild)
         } else {
-            self.add(name, value, serial_pa)
+            self.add(name, value, serial_pa, need_rebuild)
         }
     }
 }
