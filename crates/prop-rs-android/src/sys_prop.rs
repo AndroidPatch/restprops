@@ -734,7 +734,7 @@ pub fn rebuild(context: &String, check: bool, appcompat: bool) -> SysPropResult<
             let mut prop_area = area.as_prop_area()?;
             let res = prop_area.scan_allocations()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            if !res.has_abnormal {
+            if !res.has_abnormal && res.holes.is_empty() {
                 return Ok(())
             }
         }
