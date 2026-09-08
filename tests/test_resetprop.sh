@@ -278,6 +278,7 @@ for i in 1 2 3 4 5; do
 done
 register_cleanup "ro.${TEST_PREFIX}.readonly"
 register_cleanup "ro.${TEST_PREFIX}.ro_set"
+register_cleanup "ro.${TEST_PREFIX}.layout"
 for name in basic ponly del list; do
     register_cleanup "${PERSIST_PREFIX}.${name}"
 done
@@ -910,6 +911,109 @@ assert_eq "15.2d 切换回短值" "back_to_short" "$val"
 # ============================================================================
 # 测试组 16: serial 计数器和长度
 # ============================================================================
+
+section "15.3 ro long value updates"
+
+ro_long_key="ro.${TEST_PREFIX}.layout"
+ro_long_stderr="${TMP}/_rp_stderr_ro_$$"
+
+$RESETPROP -d "$ro_long_key" >/dev/null 2>&1
+
+short_val="short"
+long_val_a=""
+i=0
+while [ $i -lt 150 ]; do
+    long_val_a="${long_val_a}A"
+    i=$((i + 1))
+done
+long_val_b=""
+i=0
+while [ $i -lt 150 ]; do
+    long_val_b="${long_val_b}B"
+    i=$((i + 1))
+done
+
+$RESETPROP -n "$ro_long_key" "$short_val" >/dev/null 2>"$ro_long_stderr"
+rc=$?
+stderr=$(cat "$ro_long_stderr")
+if [ $rc -eq 0 ]; then
+    assert_not_contains "15.3a create short ro prop without rebuild warning" "rebuild is needed" "$stderr"
+else
+    log_fail "15.3a create short ro prop" "exit=0" "exit=$rc"
+fi
+
+slot=$(rp_test --inspect-slot "$ro_long_key")
+rc=$?
+if [ $rc -eq 0 ]; then
+    assert_contains "15.3b short ro prop is inline" "layout=inline" "$slot"
+    assert_contains "15.3c short ro prop tail cleared" "tail_nonzero=0" "$slot"
+else
+    log_fail "15.3b inspect short ro prop" "exit=0" "exit=$rc"
+fi
+val=$(rp_get "$ro_long_key")
+assert_eq "15.3d short ro prop value correct" "$short_val" "$val"
+
+$RESETPROP -n "$ro_long_key" "$long_val_a" >/dev/null 2>"$ro_long_stderr"
+rc=$?
+stderr=$(cat "$ro_long_stderr")
+if [ $rc -eq 0 ]; then
+    assert_contains "15.3e short->long warns rebuild" "rebuild is needed" "$stderr"
+else
+    log_fail "15.3e short->long update" "exit=0" "exit=$rc"
+fi
+
+slot=$(rp_test --inspect-slot "$ro_long_key")
+rc=$?
+if [ $rc -eq 0 ]; then
+    assert_contains "15.3f short->long becomes long" "layout=long" "$slot"
+    assert_contains "15.3g short->long length correct" "value_len=150" "$slot"
+else
+    log_fail "15.3f inspect short->long prop" "exit=0" "exit=$rc"
+fi
+val=$(rp_get "$ro_long_key")
+assert_eq "15.3h short->long value correct" "$long_val_a" "$val"
+
+$RESETPROP -n "$ro_long_key" "$long_val_b" >/dev/null 2>"$ro_long_stderr"
+rc=$?
+stderr=$(cat "$ro_long_stderr")
+if [ $rc -eq 0 ]; then
+    assert_contains "15.3i long->long warns rebuild" "rebuild is needed" "$stderr"
+else
+    log_fail "15.3i long->long update" "exit=0" "exit=$rc"
+fi
+
+slot=$(rp_test --inspect-slot "$ro_long_key")
+rc=$?
+if [ $rc -eq 0 ]; then
+    assert_contains "15.3j long->long stays long" "layout=long" "$slot"
+    assert_contains "15.3k long->long length correct" "value_len=150" "$slot"
+else
+    log_fail "15.3j inspect long->long prop" "exit=0" "exit=$rc"
+fi
+val=$(rp_get "$ro_long_key")
+assert_eq "15.3l long->long value correct" "$long_val_b" "$val"
+
+$RESETPROP -n "$ro_long_key" "$short_val" >/dev/null 2>"$ro_long_stderr"
+rc=$?
+stderr=$(cat "$ro_long_stderr")
+if [ $rc -eq 0 ]; then
+    assert_contains "15.3m long->short warns rebuild" "rebuild is needed" "$stderr"
+else
+    log_fail "15.3m long->short update" "exit=0" "exit=$rc"
+fi
+
+slot=$(rp_test --inspect-slot "$ro_long_key")
+rc=$?
+if [ $rc -eq 0 ]; then
+    assert_contains "15.3n long->short becomes inline" "layout=inline" "$slot"
+    assert_contains "15.3o long->short tail cleared" "tail_nonzero=0" "$slot"
+else
+    log_fail "15.3n inspect long->short prop" "exit=0" "exit=$rc"
+fi
+val=$(rp_get "$ro_long_key")
+assert_eq "15.3p long->short value correct" "$short_val" "$val"
+
+rm -f "$ro_long_stderr"
 
 section "16. serial 计数器和长度"
 
